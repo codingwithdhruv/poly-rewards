@@ -35,41 +35,43 @@ export function parseCliArgs(): DipArbConfig {
     }
 
     // 2. Define Defaults per Coin
-    // Updated presets to match poly-all-in-one code behavior
-    // poly-all-in-one uses windowMinutes: 14 (effectively 'always open')
-    // Users can override with --entry-window=2 if they want the strict Smart Ape behavior
+    // Updated presets based on "Scavenger Mode" (Strict, High Profit, Early Entry)
     const coinDefaults: Record<CoinType, Partial<DipArbConfig>> = {
         BTC: {
-            dipThreshold: 0.35,       // 35% relative drop (Safe 2026)
-            slidingWindowMs: 4000,    // Moderate smoothing
-            leg2TimeoutSeconds: 120,  // Extended wait for rebounds
-            sumTarget: 0.97,          // 3% spread (prioritize completion)
-            shares: 10,               // Small size to minimize risk
-            windowMinutes: 10         // Early entry to avoid late traps
+            dipThreshold: 0.25,       // 25% drop
+            slidingWindowMs: 3000,    // 3s (Fast)
+            leg2TimeoutSeconds: 90,   // 1.5 min
+            sumTarget: 0.92,          // 8% spread
+            shares: 8,                // Higher conviction
+            windowMinutes: 3,         // Only first 3 mins
+            ignorePriceBelow: 0.04    // Ignore cheap option noise
         },
         ETH: {
-            dipThreshold: 0.40,       // 40% relative drop
-            slidingWindowMs: 4000,
-            leg2TimeoutSeconds: 150,  // 2.5 min wait
-            sumTarget: 0.96,          // 4% spread
-            shares: 8,                // Reduced size
-            windowMinutes: 10
-        },
-        XRP: {
-            dipThreshold: 0.50,       // 50% drop (high volatility filter)
-            slidingWindowMs: 3000,    // Faster reaction
-            leg2TimeoutSeconds: 180,  // 3 min wait for volatile alts
-            sumTarget: 0.95,          // 5% spread (thinner liquidity)
-            shares: 5,                // Smallest size
-            windowMinutes: 8          // Shortest window for safety
+            dipThreshold: 0.30,       // Stricter than BTC
+            slidingWindowMs: 3000,
+            leg2TimeoutSeconds: 90,
+            sumTarget: 0.92,
+            shares: 6,
+            windowMinutes: 3,
+            ignorePriceBelow: 0.04
         },
         SOL: {
-            dipThreshold: 0.40,       // Aligned with ETH safe metrics
-            slidingWindowMs: 4000,
-            leg2TimeoutSeconds: 150,
-            sumTarget: 0.96,
-            shares: 8,
-            windowMinutes: 10
+            dipThreshold: 0.30,       // Stricter than BTC
+            slidingWindowMs: 3000,
+            leg2TimeoutSeconds: 90,
+            sumTarget: 0.92,
+            shares: 6,
+            windowMinutes: 3,
+            ignorePriceBelow: 0.04
+        },
+        XRP: {
+            dipThreshold: 0.40,       // Strictest (High Volatility)
+            slidingWindowMs: 3000,
+            leg2TimeoutSeconds: 90,
+            sumTarget: 0.92,
+            shares: 6,
+            windowMinutes: 3,
+            ignorePriceBelow: 0.04
         },
     };
 
@@ -104,7 +106,8 @@ export function parseCliArgs(): DipArbConfig {
         leg2TimeoutSeconds: getArgValue('timeout', defaults.leg2TimeoutSeconds!),
         sumTarget: getArgValue('target', defaults.sumTarget!),
         shares: getArgValue('shares', defaults.shares!),
-        windowMinutes: getArgValue('entry-window', defaults.windowMinutes!), // exposed as --entry-window
+        windowMinutes: getArgValue('entry-window', defaults.windowMinutes!),
+        ignorePriceBelow: getArgValue('min-price', defaults.ignorePriceBelow!), // exposed as --min-price
         verbose: getBoolArg('verbose', false),
         info: args.includes('-info') || args.includes('--info'),
         redeem: args.includes('-redeem') || args.includes('--redeem')

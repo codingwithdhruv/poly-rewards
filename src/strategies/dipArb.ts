@@ -73,6 +73,7 @@ export interface DipArbConfig {
     shares: number;
     leg2TimeoutSeconds: number;
     windowMinutes: number;     // Entry allowed only in first N mins
+    ignorePriceBelow?: number; // Ignore dips if price is below this (e.g. 0.05)
     verbose?: boolean;
     info?: boolean;
     redeem?: boolean;
@@ -97,6 +98,7 @@ export class DipArbStrategy implements Strategy {
             shares: config.shares || 10,
             leg2TimeoutSeconds: config.leg2TimeoutSeconds || 60,
             windowMinutes: config.windowMinutes || 2,
+            ignorePriceBelow: config.ignorePriceBelow || 0,
             verbose: config.verbose || false
         };
 
@@ -384,6 +386,11 @@ export class DipArbStrategy implements Strategy {
         }
 
         if (highPrice > 0 && history.length > 2) {
+            // Ignore Low Prices (Noise filter)
+            if (this.config.ignorePriceBelow && currentPrice < this.config.ignorePriceBelow) {
+                return;
+            }
+
             const drop = (highPrice - currentPrice) / highPrice;
             if (drop >= this.config.dipThreshold) {
                 state.stats.signalsDetected++;
