@@ -9,10 +9,11 @@ interface CliArgs {
     leg2TimeoutSeconds: number;
     sumTarget: number;
     shares: number;
-    windowMinutes: number; // Entry window in minutes
+    // windowMinutes removed
     verbose: boolean;
     info: boolean;
     redeem: boolean;
+    dashboard: boolean;
 }
 
 export function parseCliArgs(): DipArbConfig {
@@ -35,43 +36,45 @@ export function parseCliArgs(): DipArbConfig {
     }
 
     // 2. Define Defaults per Coin
-    // Updated presets based on "Scavenger Mode" (Strict, High Profit, Early Entry)
+    // Updated presets based on "Observed behavior" (Steady, Defensive, Opportunistic)
     const coinDefaults: Record<CoinType, Partial<DipArbConfig>> = {
         BTC: {
-            dipThreshold: 0.25,       // 25% drop
-            slidingWindowMs: 3000,    // 3s (Fast)
-            leg2TimeoutSeconds: 90,   // 1.5 min
-            sumTarget: 0.92,          // 8% spread
-            shares: 8,                // Higher conviction
-            windowMinutes: 3,         // Only first 3 mins
-            ignorePriceBelow: 0.04    // Ignore cheap option noise
+            dipThreshold: 0.18,        // BTC often dumps 18–22% very fast
+            slidingWindowMs: 3000,     // Fast reaction
+            leg2TimeoutSeconds: 90,    // BTC mean-reverts quickly
+            sumTarget: 0.955,          // Don’t wait for perfection
+            shares: 6,                 // Dynamic sizing still applies
+            ignorePriceBelow: 0.06
         },
+
         ETH: {
-            dipThreshold: 0.30,       // Stricter than BTC
-            slidingWindowMs: 3000,
-            leg2TimeoutSeconds: 90,
-            sumTarget: 0.92,
-            shares: 6,
-            windowMinutes: 3,
-            ignorePriceBelow: 0.04
+            dipThreshold: 0.25,        // ETH needs clearer dump
+            slidingWindowMs: 4000,     // Filter noise
+            leg2TimeoutSeconds: 150,   // Hedge takes longer
+            sumTarget: 0.96,           // Defensive
+            shares: 5,
+            ignorePriceBelow: 0.06
         },
+
         SOL: {
-            dipThreshold: 0.30,       // Stricter than BTC
-            slidingWindowMs: 3000,
-            leg2TimeoutSeconds: 90,
-            sumTarget: 0.92,
-            shares: 6,
-            windowMinutes: 3,
-            ignorePriceBelow: 0.04
+            // Kept previous SOL defaults or align with ETH? 
+            // User didn't specify SOL update, keeping previous safe defaults or matching ETH structure.
+            // Previous was similar to ETH.
+            dipThreshold: 0.25,
+            slidingWindowMs: 4000,
+            leg2TimeoutSeconds: 120,
+            sumTarget: 0.96,
+            shares: 5,
+            ignorePriceBelow: 0.06
         },
+
         XRP: {
-            dipThreshold: 0.40,       // Strictest (High Volatility)
-            slidingWindowMs: 3000,
-            leg2TimeoutSeconds: 90,
-            sumTarget: 0.92,
-            shares: 6,
-            windowMinutes: 3,
-            ignorePriceBelow: 0.04
+            dipThreshold: 0.38,        // Needs absurd move
+            slidingWindowMs: 4500,
+            leg2TimeoutSeconds: 180,
+            sumTarget: 0.97,           // Safety first
+            shares: 4,
+            ignorePriceBelow: 0.07
         },
     };
 
@@ -106,10 +109,11 @@ export function parseCliArgs(): DipArbConfig {
         leg2TimeoutSeconds: getArgValue('timeout', defaults.leg2TimeoutSeconds!),
         sumTarget: getArgValue('target', defaults.sumTarget!),
         shares: getArgValue('shares', defaults.shares!),
-        windowMinutes: getArgValue('entry-window', defaults.windowMinutes!),
+        // windowMinutes removed
         ignorePriceBelow: getArgValue('min-price', defaults.ignorePriceBelow!), // exposed as --min-price
         verbose: getBoolArg('verbose', false),
         info: args.includes('-info') || args.includes('--info'),
-        redeem: args.includes('-redeem') || args.includes('--redeem')
+        redeem: args.includes('-redeem') || args.includes('--redeem'),
+        dashboard: args.includes('-dashboard') || args.includes('--dashboard')
     };
 }

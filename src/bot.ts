@@ -1,26 +1,36 @@
-import { createClobClient } from "./clients/clob.js";
-import { createRelayClient } from "./clients/relay.js";
+import { ClobClient } from "@polymarket/clob-client";
+import { RelayClient } from "@polymarket/builder-relayer-client";
 import { Strategy } from "./strategies/types.js";
 
-export class Bot {
-    private strategy: Strategy;
+export interface BotConfig {
+    scanIntervalMs: number;
+    logIntervalMs: number;
+}
 
-    constructor(strategy: Strategy) {
+export class Bot {
+    private clobClient: ClobClient;
+    private relayClient: RelayClient;
+    private strategy: Strategy;
+    private config: BotConfig;
+
+    constructor(clobClient: ClobClient, relayClient: RelayClient, strategy: Strategy, config: BotConfig) {
+        this.clobClient = clobClient;
+        this.relayClient = relayClient;
         this.strategy = strategy;
+        this.config = config;
     }
 
     async start() {
         try {
-            console.log("Starting Bot...");
+            console.log("Starting Bot wrapper...");
 
-            console.log("Initializing local wallet and relay client...");
-            const relayClient = createRelayClient();
-
-            console.log("Initializing CLOB client...");
-            const clobClient = await createClobClient();
+            // Strategy Init
+            // We pass the clients we already created in main.ts
+            // Note: Some strategies might expect to create their own clients if none passed?
+            // But DipArbStrategy.init(clob, relay) expects them.
 
             console.log("Initializing strategy...");
-            await this.strategy.init(clobClient, relayClient);
+            await this.strategy.init(this.clobClient, this.relayClient);
 
             console.log("Running strategy...");
             await this.strategy.run();
