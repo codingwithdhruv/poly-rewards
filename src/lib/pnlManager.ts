@@ -33,7 +33,7 @@ export interface CycleStats {
     status: 'OPEN' | PnlReason;
 }
 
-export type PnlReason = 'WIN' | 'LOSS' | 'ABANDON' | 'EARLY_EXIT' | 'LATE_EXIT' | 'ARB';
+export type PnlReason = 'WIN' | 'LOSS' | 'ABANDON' | 'EARLY_EXIT' | 'LATE_EXIT' | 'ARB' | 'ARB_LOCKED';
 
 interface GlobalState {
     coins: Record<string, CoinPnL>;
@@ -154,6 +154,20 @@ export class PnlManager {
             coinStats.currentExposure = totalExp;
         }
         this.save();
+    }
+
+    public logPartialProfit(marketId: string, profitUsd: number) {
+        this.sync();
+        const cycle = this.state.activeCycles[marketId];
+        if (cycle) {
+            const coin = cycle.coin;
+            const stats = this.getCoinStats(coin);
+            stats.realizedPnL += profitUsd;
+
+            // ❌ DO NOT touch wallet balance here. Balance updates must come from RPC only.
+
+            this.save();
+        }
     }
 
     public closeCycle(marketId: string, result: PnlReason, pnl: number) {

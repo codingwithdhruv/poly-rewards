@@ -77,7 +77,7 @@ interface MarketState {
     // Helper to map tokenId to 'yes' or 'no'
     tokenIdToSide: Map<string, 'yes' | 'no'>;
 
-    status: 'scanning' | 'complete' | 'EXITING';
+    status: 'scanning' | 'complete' | 'EXITING' | 'partial_unwind';
     endTime: number;
     startTime: number;
     slug: string;
@@ -105,6 +105,13 @@ export interface LateExitConfig {
     minProfitUsd: number;         // e.g. 0.00 (just be positive)
 }
 
+export interface PartialUnwindConfig {
+    enabled: boolean;
+    timeRemainingSeconds: number; // e.g. 45
+    minWinnerPrice: number;       // e.g. 0.70
+    minProfitUsd: number;         // e.g. 0.20
+}
+
 export interface EarlyExitConfig {
     enabled: boolean;
     minProfitPct: number;   // e.g. 0.15 = +15%
@@ -127,6 +134,7 @@ export interface DipArbConfig {
     strategy?: string;
     earlyExit?: EarlyExitConfig;
     lateExit?: LateExitConfig;
+    partialUnwind?: PartialUnwindConfig;
     // windowMinutes removed
 }
 
@@ -165,6 +173,12 @@ export class DipArbStrategy implements Strategy {
                 timeRemainingSeconds: 60,
                 minWinnerPrice: 0.70,
                 minProfitUsd: 0.01 // Minimal profit required, just don't exit for loss
+            },
+            partialUnwind: config.partialUnwind || {
+                enabled: true,
+                timeRemainingSeconds: 45,
+                minWinnerPrice: 0.70,
+                minProfitUsd: 0.20
             }
         } as DipArbConfig;
 
@@ -361,6 +375,9 @@ export class DipArbStrategy implements Strategy {
             const now = Date.now();
             const timeLeft = Math.round((state.endTime - now) / 1000);
 
+            // [SAFETY] Race Condition Guard - Skip if busy
+            if (state.status !== 'scanning') continue;
+
             // [SAFETY] Daily Drawdown Kill Switch (5%)
             if (this.pnlManager.checkDrawdown(0.05)) {
                 console.error(color("\n💀 FATAL: DAILY DRAWDOWN LIMIT EXCEEDED (5%). SHUTTING DOWN.", COLORS.BG_RED + COLORS.WHITE));
@@ -371,6 +388,9 @@ export class DipArbStrategy implements Strategy {
             // Detect Naked Position
             const isNakedYes = (state.position.yes.totalShares > 0 && state.position.no.totalShares === 0);
             const isNakedNo = (state.position.no.totalShares > 0 && state.position.yes.totalShares === 0);
+
+            // 2. Force Hedge Naked Positions
+            // Guard already ensured status === 'scanning', so this is safe.
 
             if (isNakedYes || isNakedNo) {
                 const nakedSide = isNakedYes ? 'yes' : 'no';
@@ -423,14 +443,13 @@ export class DipArbStrategy implements Strategy {
             }
 
             // [OPTIMIZATION] LATE DOMINANCE EXIT (Time-Weighted)
-            if (state.status !== 'complete' && state.status !== 'EXITING') {
-                await this.checkAndExecuteLateExit(state);
-            }
+            await this.checkAndExecuteLateExit(state);
 
             // [OPTIMIZATION] EARLY EXIT (Profit Locking)
-            if (state.status !== 'complete' && state.status !== 'EXITING') {
-                await this.checkAndExecuteEarlyExit(state);
-            }
+            await this.checkAndExecuteEarlyExit(state);
+
+            // [OPTIMIZATION] PARTIAL UNWIND (Winner-Only Exit)
+            await this.checkAndExecutePartialUnwind(state);
 
             // AUTOMATIC ROTATION TRIGGER (Market End)
             if (timeLeft <= 0) {
@@ -806,7 +825,7 @@ export class DipArbStrategy implements Strategy {
     }
 
     private checkPairCost(state: MarketState) {
-        if (state.status === 'complete' || state.status === 'EXITING') return; // Strict Guard
+        if (state.status === 'complete' || state.status === 'EXITING' || state.status === 'partial_unwind') return; // Strict Guard
 
         const yes = state.position.yes;
         const no = state.position.no;
@@ -829,7 +848,12 @@ export class DipArbStrategy implements Strategy {
                 const totalProfit = matchedShares * profitPerPair;
 
                 // Update PnL Manager
-                this.pnlManager.closeCycle(state.marketId, 'WIN', totalProfit);
+                // [FIX] Convert Sum Target Win to ARB_LOCKED (Unrealized)
+                // We do NOT add profit here because it is not realized until redemption.
+                console.log(color("✅ SUM TARGET HIT! Locking Arb for Expiry.", COLORS.GREEN));
+
+                // Record as ARB_LOCKED with 0 realized PnL for now
+                this.pnlManager.closeCycle(state.marketId, "ARB_LOCKED", 0);
 
                 this.logResult(state, pairCost, totalProfit);
             }
@@ -1083,6 +1107,99 @@ export class DipArbStrategy implements Strategy {
 
         } catch (e) {
             console.error("Error late exit:", e);
+            state.status = 'scanning';
+        }
+    }
+
+    // --- PARTIAL UNWIND (WINNER-ONLY EXIT) ---
+    private async checkAndExecutePartialUnwind(state: MarketState) {
+        if (!this.config.partialUnwind?.enabled || !this.clobClient) return;
+        // [STRICT GUARD] Only allow exit if currently in normal scanning mode
+        if (state.status !== 'scanning') return;
+
+        const yes = state.position.yes;
+        const no = state.position.no;
+
+        // Must hold positions
+        if (yes.totalShares <= 0 || no.totalShares <= 0) return;
+
+        const timeLeftMs = state.endTime - Date.now();
+        const triggerTime = (this.config.partialUnwind.timeRemainingSeconds || 45) * 1000;
+
+        if (timeLeftMs > triggerTime) return; // Not late enough
+
+        try {
+            // 1. Fetch Orderbook
+            const yesBook = await this.clobClient.getOrderBook(state.tokenIds[0]);
+            const noBook = await this.clobClient.getOrderBook(state.tokenIds[1]);
+
+            if (!yesBook.bids.length || !noBook.bids.length) return;
+
+            // 2. Determine Dominance (Winner)
+            const bestBidYes = parseFloat(yesBook.bids[0].price);
+            const bestBidNo = parseFloat(noBook.bids[0].price);
+
+            const isYesWinner = bestBidYes > bestBidNo;
+            const winnerPrice = isYesWinner ? bestBidYes : bestBidNo;
+            const winnerSideState = isYesWinner ? yes : no;
+
+            const minWinnerPrice = this.config.partialUnwind.minWinnerPrice || 0.70;
+            if (winnerPrice < minWinnerPrice) return;
+
+            // 3. Profit Check (Winner Only)
+            const sharesToSell = winnerSideState.totalShares;
+            const winnerPnLPerShare = winnerPrice - winnerSideState.avgPrice;
+            const totalWinnerProfit = winnerPnLPerShare * sharesToSell; // [FIX] Compare total profit
+            const minProfit = this.config.partialUnwind.minProfitUsd || 0.20;
+
+            if (totalWinnerProfit < minProfit) return;
+
+            // [FIX] Liquidity Check
+            if (!this.hasSufficientLiquidity(isYesWinner ? yesBook.bids : noBook.bids, sharesToSell)) {
+                return; // Not enough depth to absorb sell
+            }
+
+            // 4. EXECUTION
+            console.log(color(`\n🧘 PARTIAL UNWIND TRIGGERED (${(timeLeftMs / 1000).toFixed(1)}s left)`, COLORS.BRIGHT + COLORS.CYAN));
+            console.log(color(`   Winner: ${winnerPrice.toFixed(2)} | Profit: $${totalWinnerProfit.toFixed(2)}`, COLORS.CYAN));
+            console.log(color(`   Action: Selling Winner Only. Holding Loser as free roll.`, COLORS.CYAN));
+
+            // Lock State
+            state.status = 'partial_unwind';
+
+            const winnerSide = {
+                id: state.tokenIds[isYesWinner ? 0 : 1],
+                price: winnerPrice,
+                name: isYesWinner ? 'YES' : 'NO'
+            };
+
+
+
+            // EXECUTE SELL
+            const soldShares = await this.executeSell(winnerSide.id, sharesToSell, winnerSide.price, "PARTIAL-UNWIND");
+
+            if (soldShares === 0) {
+                console.log(color("   ❌ Partial Unwind Sell Failed. Reverting to scanning.", COLORS.RED));
+                state.status = 'scanning';
+                return;
+            }
+
+            // SUCCESS - UPDATE STATE
+            // [FIX] Zero out Cost and AvgPrice to prevent ghost losses if cycle is later Abandoned
+            winnerSideState.totalShares = 0;
+            winnerSideState.totalCost = 0;
+            winnerSideState.avgPrice = 0;
+
+            // [FIX] Log Realized Profit immediately
+            this.pnlManager.logPartialProfit(state.marketId, totalWinnerProfit);
+
+            // We do NOT zero out the loser side. We keep it.
+            // We do NOT close the cycle. The cycle is still open until expiry or manual redemption.
+
+            console.log(color("   ✅ Partial Unwind Complete. Winner sold. Loser held.", COLORS.GREEN));
+
+        } catch (e) {
+            console.error("Error partial unwind:", e);
             state.status = 'scanning';
         }
     }
