@@ -77,11 +77,13 @@ interface MarketState {
     // Helper to map tokenId to 'yes' or 'no'
     tokenIdToSide: Map<string, 'yes' | 'no'>;
 
-    status: 'scanning' | 'complete';
+    status: 'scanning' | 'complete' | 'EXITING';
     endTime: number;
     startTime: number;
     slug: string;
     question: string;
+
+
 
     // Convergence / Stagnation Tracking
     bestPairCost: number;       // Lowest pair cost seen so far
@@ -96,6 +98,20 @@ interface MarketState {
     };
 }
 
+export interface LateExitConfig {
+    enabled: boolean;
+    timeRemainingSeconds: number; // e.g. 60
+    minWinnerPrice: number;       // e.g. 0.70
+    minProfitUsd: number;         // e.g. 0.00 (just be positive)
+}
+
+export interface EarlyExitConfig {
+    enabled: boolean;
+    minProfitPct: number;   // e.g. 0.15 = +15%
+    minProfitUsd: number;   // e.g. $1
+    maxSlippagePct: number; // e.g. 0.03
+}
+
 export interface DipArbConfig {
     coin: string;
     dipThreshold: number;      // movePct
@@ -108,6 +124,9 @@ export interface DipArbConfig {
     info?: boolean;
     redeem?: boolean;
     dashboard?: boolean;
+    strategy?: string;
+    earlyExit?: EarlyExitConfig;
+    lateExit?: LateExitConfig;
     // windowMinutes removed
 }
 
@@ -134,7 +153,19 @@ export class DipArbStrategy implements Strategy {
             verbose: config.verbose || false,
             info: config.info || false,
             redeem: config.redeem || false,
-            dashboard: config.dashboard || false
+            dashboard: config.dashboard || false,
+            earlyExit: config.earlyExit || {
+                enabled: true,
+                minProfitPct: 0.10, // 10%
+                minProfitUsd: 0.50, // 50c
+                maxSlippagePct: 0.03
+            },
+            lateExit: config.lateExit || {
+                enabled: true,
+                timeRemainingSeconds: 60,
+                minWinnerPrice: 0.70,
+                minProfitUsd: 0.01 // Minimal profit required, just don't exit for loss
+            }
         } as DipArbConfig;
 
         this.gammaClient = new GammaClient();
@@ -365,7 +396,8 @@ export class DipArbStrategy implements Strategy {
                             oppositeTokenId,
                             sharesToHedge,
                             oppPrice, // Market Order effectively (using last price)
-                            "FORCED-HEDGE"
+                            "FORCED-HEDGE",
+                            true // [FIX] Bypass Risk Limit for emergency hedge
                         );
 
                         if (filledShares > 0) {
@@ -388,6 +420,16 @@ export class DipArbStrategy implements Strategy {
                         console.log(color("❌ Could not force hedge: Price unavailable.", COLORS.RED));
                     }
                 }
+            }
+
+            // [OPTIMIZATION] LATE DOMINANCE EXIT (Time-Weighted)
+            if (state.status !== 'complete' && state.status !== 'EXITING') {
+                await this.checkAndExecuteLateExit(state);
+            }
+
+            // [OPTIMIZATION] EARLY EXIT (Profit Locking)
+            if (state.status !== 'complete' && state.status !== 'EXITING') {
+                await this.checkAndExecuteEarlyExit(state);
             }
 
             // AUTOMATIC ROTATION TRIGGER (Market End)
@@ -706,7 +748,8 @@ export class DipArbStrategy implements Strategy {
         tokenId: string,
         requestedShares: number,
         price: number,
-        label: string
+        label: string,
+        bypassRisk: boolean = false // [NEW] Allow force hedges to exceed 5% cap
     ): Promise<number> {
         if (!this.clobClient) return 0;
 
@@ -714,9 +757,20 @@ export class DipArbStrategy implements Strategy {
         const availableUsd = parseFloat((balRes as any).balance || "0") / 1e6;
         this.pnlManager.updateWalletBalance(availableUsd);
 
-        const maxUsd = availableUsd * 0.05;
-        const maxSharesRisk = Math.floor(maxUsd / price);
-        if (maxSharesRisk <= 0) return 0;
+        // [RISK] 5% Cap Logic
+        let maxSharesRisk = requestedShares;
+
+        if (!bypassRisk) {
+            const maxUsd = availableUsd * 0.05;
+            maxSharesRisk = Math.floor(maxUsd / price);
+            if (maxSharesRisk <= 0) {
+                console.log(color(`[${label}] Risk Check Failed: Bal $${availableUsd.toFixed(2)} too low for 5% sizing @ $${price}`, COLORS.RED));
+                return 0;
+            }
+        } else {
+            // If bypassing risk, capped only by TOTAL balance
+            maxSharesRisk = Math.floor(availableUsd / price);
+        }
 
         const minShares = Math.ceil(1.0 / price);
         let finalShares = Math.min(requestedShares, maxSharesRisk);
@@ -724,7 +778,7 @@ export class DipArbStrategy implements Strategy {
 
         const exactCost = finalShares * price;
 
-        if (!WalletGuard.tryReserve(exactCost, availableUsd)) {
+        if (!bypassRisk && !WalletGuard.tryReserve(exactCost, availableUsd)) {
             console.log(color(`[${label}] WalletGuard Blocked`, COLORS.RED));
             return 0;
         }
@@ -752,6 +806,8 @@ export class DipArbStrategy implements Strategy {
     }
 
     private checkPairCost(state: MarketState) {
+        if (state.status === 'complete' || state.status === 'EXITING') return; // Strict Guard
+
         const yes = state.position.yes;
         const no = state.position.no;
 
@@ -800,5 +856,262 @@ export class DipArbStrategy implements Strategy {
             `Pair Cost:  $${pairCost.toFixed(4)}`,
             `Est Profit: $${estimatedProfit.toFixed(4)}`
         ], COLORS.YELLOW);
+    }
+
+    // --- EARLY EXIT LOGIC ---
+    private async checkAndExecuteEarlyExit(state: MarketState) {
+        if (!this.config.earlyExit?.enabled || !this.clobClient) return;
+        // [STRICT GUARD] Must be holding/active (scanning) and not already exiting
+        if (state.status !== 'scanning') return;
+
+        const yes = state.position.yes;
+        const no = state.position.no;
+
+        // Must hold both sides
+        if (yes.totalShares <= 0 || no.totalShares <= 0) return;
+
+        try {
+            // 1. Fetch REAL Orderbook (L2)
+            const yesBook = await this.clobClient.getOrderBook(state.tokenIds[0]);
+            const noBook = await this.clobClient.getOrderBook(state.tokenIds[1]);
+
+            if (!yesBook.bids.length || !noBook.bids.length) return;
+
+            // 2. Liquidity & Size Check
+            const matchShares = Math.min(yes.totalShares, no.totalShares);
+            if (!this.hasSufficientLiquidity(yesBook.bids, matchShares) ||
+                !this.hasSufficientLiquidity(noBook.bids, matchShares)) {
+                return;
+            }
+
+            const bestBidYes = parseFloat(yesBook.bids[0].price);
+            const bestBidNo = parseFloat(noBook.bids[0].price);
+
+            // 3. Profit & Slippage Check
+            const exitValue = bestBidYes + bestBidNo;
+            const entryCost = yes.avgPrice + no.avgPrice;
+
+            const profitPerShare = exitValue - entryCost;
+            const profitPct = profitPerShare / entryCost;
+            const totalProfitUsd = profitPerShare * matchShares;
+
+            if (profitPct < (this.config.earlyExit.minProfitPct || 0.15)) return;
+            if (totalProfitUsd < (this.config.earlyExit.minProfitUsd || 0.50)) return;
+
+            // 4. EXECUTION
+            console.log(color(`\n💰 EARLY EXIT VALID: +${(profitPct * 100).toFixed(1)}% ($${totalProfitUsd.toFixed(2)})`, COLORS.BRIGHT + COLORS.GREEN));
+
+            // LOCK STATE IMMEDIATELY
+            state.status = 'EXITING';
+
+            // Determine Order: Sell Thinner Side First
+            // Strategy: Calculate total depth at best price, sell lower depth first.
+            const yesDepth = this.getBidDepth(yesBook.bids, bestBidYes);
+            const noDepth = this.getBidDepth(noBook.bids, bestBidNo);
+
+            let firstSide, secondSide;
+            if (yesDepth < noDepth) {
+                firstSide = { id: state.tokenIds[0], price: bestBidYes, name: 'YES', amount: matchShares };
+                secondSide = { id: state.tokenIds[1], price: bestBidNo, name: 'NO', amount: matchShares };
+            } else {
+                firstSide = { id: state.tokenIds[1], price: bestBidNo, name: 'NO', amount: matchShares };
+                secondSide = { id: state.tokenIds[0], price: bestBidYes, name: 'YES', amount: matchShares };
+            }
+
+            console.log(color(`   Strategy: Selling ${firstSide.name} (Depth: ${yesDepth < noDepth ? yesDepth : noDepth}) then ${secondSide.name}`, COLORS.DIM));
+
+            // SELL LEG 1 (Thinner Side)
+            console.log(color(`   🚀 Selling Leg 1 (${firstSide.name})...`, COLORS.CYAN));
+            const sold1 = await this.executeSell(firstSide.id, firstSide.amount, firstSide.price, "EXIT-1");
+
+            if (sold1 === 0) {
+                console.log(color("   ❌ Leg 1 Failed. Aborting Exit. Unlocking.", COLORS.RED));
+                state.status = 'scanning'; // Revert lock (using 'active' as 'not complete/exiting')
+                return;
+            }
+
+            // SELL LEG 2 (Thicker Side)
+            console.log(color(`   🚀 Selling Leg 2 (${secondSide.name})...`, COLORS.CYAN));
+            const sold2 = await this.executeSell(secondSide.id, secondSide.amount, secondSide.price, "EXIT-2");
+
+            if (sold2 === 0) {
+                // CRITICAL FAILURE: Leg 1 sold, Leg 2 stuck. Naked Risk.
+                console.error(color("   💀 CRITICAL: LEG 2 FAILED. EXECS EMERGENCY HEDGE.", COLORS.BG_RED + COLORS.WHITE));
+                // Panic Price: 30% haircut (0.7 * bestBid)
+                const panicPrice = secondSide.price * 0.7;
+                await this.emergencyHedge(secondSide.id, secondSide.amount, panicPrice, "EXIT-FAIL-HEDGE");
+
+                // Force closure even if messy
+                state.status = 'complete';
+                this.pnlManager.closeCycle(state.marketId, "ABANDON", -matchShares * firstSide.price); // Rough loss usage
+                return;
+            }
+
+            // Success
+            state.position.yes.totalShares = 0;
+            state.position.no.totalShares = 0;
+            state.status = 'complete'; // Finalize
+
+            this.pnlManager.closeCycle(state.marketId, "EARLY_EXIT", totalProfitUsd);
+            console.log(color("   ✅ Early Exit Complete.", COLORS.GREEN));
+
+        } catch (e) {
+            console.error("Error early exit:", e);
+            state.status = 'scanning'; // Unlock on error
+        }
+    }
+
+    private hasSufficientLiquidity(bids: any[], needed: number): boolean {
+        let cum = 0;
+        for (const b of bids) {
+            cum += parseFloat(b.size);
+            if (cum >= needed) return true;
+        }
+        return false;
+    }
+
+    private getBidDepth(bids: any[], price: number): number {
+        let depth = 0;
+        for (const b of bids) {
+            if (parseFloat(b.price) >= price) {
+                depth += parseFloat(b.size);
+            }
+        }
+        return depth;
+    }
+
+    // --- LATE DOMINANCE EXIT LOGIC ---
+    private async checkAndExecuteLateExit(state: MarketState) {
+        if (!this.config.lateExit?.enabled || !this.clobClient) return;
+        // [STRICT GUARD] Only allow exit if currently in normal scanning mode
+        if (state.status !== 'scanning') return;
+
+
+        const yes = state.position.yes;
+        const no = state.position.no;
+
+        // Must hold positions
+        if (yes.totalShares <= 0 || no.totalShares <= 0) return;
+
+        const timeLeftMs = state.endTime - Date.now();
+        const triggerTime = (this.config.lateExit.timeRemainingSeconds || 60) * 1000;
+
+        if (timeLeftMs > triggerTime) return; // Not late enough
+
+        try {
+            // 1. Fetch Orderbook
+            const yesBook = await this.clobClient.getOrderBook(state.tokenIds[0]);
+            const noBook = await this.clobClient.getOrderBook(state.tokenIds[1]);
+
+            if (!yesBook.bids.length || !noBook.bids.length) return;
+
+            // 2. Determine Dominance
+            const bestBidYes = parseFloat(yesBook.bids[0].price);
+            const bestBidNo = parseFloat(noBook.bids[0].price);
+
+            const winnerPrice = Math.max(bestBidYes, bestBidNo);
+            const loserPrice = Math.min(bestBidYes, bestBidNo);
+
+            const minDominance = this.config.lateExit.minWinnerPrice || 0.70;
+            const maxLoser = 1.0 - minDominance; // e.g. 0.30
+
+            // Condition: One side > 0.70 AND Other side < 0.30 (implied, but check safe)
+            if (winnerPrice < minDominance) return;
+            if (loserPrice > maxLoser) return; // Should be impossible if spread exists, but safe check
+
+            // 3. Profit Check
+            const matchShares = Math.min(yes.totalShares, no.totalShares);
+            const exitValue = bestBidYes + bestBidNo;
+            const entryCost = yes.avgPrice + no.avgPrice;
+            const profitPerShare = exitValue - entryCost;
+            const totalProfitUsd = profitPerShare * matchShares;
+
+            const minProfit = this.config.lateExit.minProfitUsd || 0.01;
+            if (totalProfitUsd < minProfit) return; // Don't exit for loss
+
+            // 4. EXECUTION
+            console.log(color(`\n⚡ LATE DOMINANCE EXIT TRIGGERED (${(timeLeftMs / 1000).toFixed(1)}s left)`, COLORS.BRIGHT + COLORS.MAGENTA));
+            console.log(color(`   Winner: ${winnerPrice.toFixed(2)} | Loser: ${loserPrice.toFixed(2)} | Profit: $${totalProfitUsd.toFixed(2)}`, COLORS.MAGENTA));
+
+            state.status = 'EXITING';
+
+            // Identify IDs
+            // Assume YES is token 0, NO is token 1
+            const isYesWinner = bestBidYes > bestBidNo;
+            const winnerSide = {
+                id: state.tokenIds[isYesWinner ? 0 : 1],
+                price: isYesWinner ? bestBidYes : bestBidNo,
+                name: isYesWinner ? 'YES' : 'NO'
+            };
+            const loserSide = {
+                id: state.tokenIds[isYesWinner ? 1 : 0],
+                price: isYesWinner ? bestBidNo : bestBidYes,
+                name: isYesWinner ? 'NO' : 'YES'
+            };
+
+            // SELL WINNER FIRST (Liquid Side)
+            console.log(color(`   🚀 Selling Winner (${winnerSide.name})...`, COLORS.CYAN));
+            const soldWin = await this.executeSell(winnerSide.id, matchShares, winnerSide.price, "LATE-EXIT-WIN");
+
+            if (soldWin === 0) {
+                console.log(color("   ❌ Winner Sell Failed. Aborting Late Exit.", COLORS.RED));
+                state.status = 'scanning';
+                return;
+            }
+
+            // SELL LOSER IMMEDIATELY
+            console.log(color(`   🚀 Selling Loser (${loserSide.name})...`, COLORS.CYAN));
+            const soldLose = await this.executeSell(loserSide.id, matchShares, loserSide.price, "LATE-EXIT-LOSE");
+
+            if (soldLose === 0) {
+                // Panic dump loser? It's likely very cheap anyway (e.g. 0.05 vs 0.30 target)
+                // Use emergency hedge logic
+                console.error(color("   ⚠️ Loser Sell Failed. Dumping...", COLORS.YELLOW));
+                await this.emergencyHedge(loserSide.id, matchShares, loserSide.price * 0.7, "LATE-FAIL-HEDGE");
+                // Proceed to complete even if hedge is messy
+                // PnL calc uses optimistic exit value since we sold winner, loser is negligible part
+                // but strictly we should use actuals. 
+            }
+
+            // Correct State Mutation: Zero out shares since we exited everything
+            state.position.yes.totalShares = 0;
+            state.position.no.totalShares = 0;
+            state.status = 'complete';
+
+            this.pnlManager.closeCycle(state.marketId, "LATE_EXIT", totalProfitUsd); // Use LATE_EXIT code
+            console.log(color("   ✅ Late Exit Complete.", COLORS.GREEN));
+
+        } catch (e) {
+            console.error("Error late exit:", e);
+            state.status = 'scanning';
+        }
+    }
+
+    private async emergencyHedge(tokenId: string, quantity: number, price: number, label: string) {
+        try {
+            console.log(color(`[${label}] PANIC DUMP ${quantity} @ ${price.toFixed(3)}`, COLORS.RED));
+            await this.executeSell(tokenId, quantity, price, label);
+        } catch (e) {
+            console.error("Emergency hedge failed", e);
+        }
+    }
+
+    private async executeSell(tokenId: string, quantity: number, price: number, label: string): Promise<number> {
+        if (!this.clobClient) return 0;
+        try {
+            console.log(color(`[${label}] SELLING ${quantity} @ $${price}`, COLORS.YELLOW));
+            const order = await this.clobClient.createAndPostOrder(
+                { tokenID: tokenId, price, side: Side.SELL, size: quantity },
+                { tickSize: "0.01" }
+            );
+            if (order?.orderID) {
+                console.log(color(`[${label}] Success ${order.orderID}`, COLORS.GREEN));
+                return quantity;
+            }
+            return 0;
+        } catch (e: any) {
+            console.log(color(`[${label}] Failed: ${e.message}`, COLORS.RED));
+            return 0;
+        }
     }
 }

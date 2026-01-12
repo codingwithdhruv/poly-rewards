@@ -30,8 +30,10 @@ export interface CycleStats {
     startTs: number;
     yesCost: number;
     noCost: number;
-    status: 'OPEN' | 'WIN' | 'LOSS' | 'ABANDON';
+    status: 'OPEN' | PnlReason;
 }
+
+export type PnlReason = 'WIN' | 'LOSS' | 'ABANDON' | 'EARLY_EXIT' | 'LATE_EXIT' | 'ARB';
 
 interface GlobalState {
     coins: Record<string, CoinPnL>;
@@ -154,7 +156,7 @@ export class PnlManager {
         this.save();
     }
 
-    public closeCycle(marketId: string, result: 'WIN' | 'LOSS' | 'ABANDON', pnl: number) {
+    public closeCycle(marketId: string, result: PnlReason, pnl: number) {
         this.sync();
         const cycle = this.state.activeCycles[marketId];
         if (cycle) {
@@ -163,9 +165,13 @@ export class PnlManager {
             const stats = this.getCoinStats(coin);
 
             stats.cyclesCompleted++;
-            if (result === 'WIN') stats.cyclesWon++;
-            else if (result === 'LOSS') stats.cyclesLost++;
-            else stats.cyclesAbandoned++;
+            if (result === 'WIN' || result === 'EARLY_EXIT' || result === 'LATE_EXIT' || result === 'ARB') {
+                stats.cyclesWon++;
+            } else if (result === 'LOSS') {
+                stats.cyclesLost++;
+            } else {
+                stats.cyclesAbandoned++;
+            }
 
             stats.realizedPnL += pnl;
 

@@ -1,0 +1,16 @@
+#!/bin/bash
+
+# Usage: ./arb [coin] [flags]
+# Example: ./arb btc --shares=50
+
+COIN=$1
+shift # Remove the first argument (coin) so the rest can be passed directly
+
+if [ -z "$COIN" ]; then
+  echo "Usage: ./arb <coin> [options]"
+  echo "Coins: btc, eth, sol, xrp"
+  exit 1
+fi
+
+# Run the bot with the coin flag AND the -arb flag to trigger TruePairArbStrategy
+npx tsx src/main.ts -arb --$COIN "$@"

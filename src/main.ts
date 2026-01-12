@@ -3,6 +3,7 @@ import { createClobClient } from "./clients/clob.js";
 import { createRelayClient } from "./clients/relay.js";
 import { parseCliArgs } from "./config/args.js";
 import { DipArbStrategy, DipArbConfig } from "./strategies/dipArb.js";
+import { TruePairArbStrategy } from "./strategies/TruePairArbStrategy.js";
 import { Bot, BotConfig } from "./bot.js";
 import { PnlManager } from "./lib/pnlManager.js"; // Import PnlManager
 
@@ -124,8 +125,18 @@ async function main() {
     const clobClient = await createClobClient(rpcUrl, privateKey, chainId);
 
     // 3. Strategy
-    console.log("Initializing strategy...");
-    const strategy = new DipArbStrategy(args);
+    console.log(`Initializing strategy (${args.strategy || 'dip'})...`);
+    let strategy;
+
+    if (args.strategy === 'true-arb') {
+        strategy = new TruePairArbStrategy({
+            coin: args.coin,
+            maxRiskPct: 0.05, // Default safe configs or map from args if needed
+            // Map relevant args or rely on strategy defaults
+        });
+    } else {
+        strategy = new DipArbStrategy(args);
+    }
 
     // 4. Bot
     const config: BotConfig = {

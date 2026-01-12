@@ -114,6 +114,8 @@ export function parseCliArgs(): DipArbConfig {
         verbose: getBoolArg('verbose', false),
         info: args.includes('-info') || args.includes('--info'),
         redeem: args.includes('-redeem') || args.includes('--redeem'),
-        dashboard: args.includes('-dashboard') || args.includes('--dashboard')
+        dashboard: args.includes('-dashboard') || args.includes('--dashboard'),
+        // Strategy Selection
+        strategy: (args.includes('--arb') || args.includes('-arb')) ? 'true-arb' : 'dip'
     };
 }
