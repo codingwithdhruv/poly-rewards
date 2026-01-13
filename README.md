@@ -10,19 +10,27 @@
 ### 🧠 Strategic Engines
 1.  **The Gabagool (Dip Arbitrage)**
     *   **Logic**: Exploits mean-reversion in binary markets. Accumulates heavily when spreads widen (panic dumps) and exits when they normalize.
+    *   **Dynamic Entry**: Sliding window analysis (default 3s) detects rapid price drops.
     *   **Exit Waterfall**:
-        1.  **True Arb Exit** (Atomic): Closes both legs if `AskYes + AskNo < 1.00`.
+        1.  **Sum Target Exit**: Closes both legs if `AskYes + AskNo <= Target` (e.g. 0.95).
         2.  **Early Profit Lock**: Exits if `Mark-to-Market PnL > 10%`.
-        3.  **Late Dominance Exit**: Time-weighted exit if `Dominance > 70%`.
-        4.  **Partial Unwind**: Sells winner-only in last 45s to reduce variance.
+        3.  **Late Dominance Exit**: Time-weighted exit if `Dominance > 70%` near expiry.
+        4.  **Partial Unwind**: Sells winner-only in last 45s to reduce risk while keeping upside.
+
 2.  **True Pair Arb (Atomic)**
     *   **Logic**: Scans for instant risk-free arbitrage opportunities where `AskYes + AskNo < 1.00`.
     *   **Safety**: Executes atomically or rolls back. Zero directional risk.
 
-### 🛡️ Safety Systems
+### 🛡️ Safety Systems (Battle-Tested)
 *   **WalletGuard™**: Local semaphore preventing capital over-commitment. Ensures "In-Flight" orders don't exceed wallet capacity.
+*   **Tiered Risk Management**:
+    *   **Exposure Cap**: Max **15%** of wallet per market (Standard) / **50%** (Micro).
+    *   **Daily Drawdown**: Auto-shutdown if loss exceeds limit.
+        *   Micro (<$50): **50%**
+        *   Small (<$100): **25%**
+        *   Standard (>$100): **10%**
 *   **Force Hedge**: Automatically detects naked positions (failed leg 2). If timeout is reached, it panic-buys the missing leg to neutralize delta, even at a loss.
-*   **Drawdown Kill Switch**: Terminates process if session drawdown exceeds 5%.
+*   **Cycle Resumption**: Smartly detects orphaned cycles on restart, re-attaches if active, or cleans up if expired.
 *   **Proxy Support**: Native integration for Gnosis Safe / Relayer execution (Gasless).
 
 ---
@@ -34,7 +42,7 @@
 *   Polygon RPC URL (Alchemy/Infura)
 *   Polymarket API Keys (Proxy or EOA)
 
-### 1. clone
+### 1. Clone
 ```bash
 git clone https://github.com/your-username/poly-addict.git
 cd poly-addict
@@ -54,6 +62,9 @@ PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 
 # Optional: Proxy Wallet (Gnosis Safe)
 # POLY_PROXY_ADDRESS=0xYOUR_PROXY_ADDRESS
+# POLY_CLOB_API_KEY=...
+# POLY_CLOB_SECRET=...
+# POLY_CLOB_PASSPHRASE=...
 ```
 
 ---
@@ -89,7 +100,7 @@ Scans for risk-free arbs on a specific asset.
 ```bash
 ./trade -dashboard
 ```
-**Check Wallet Balances**
+**Check Wallet Balances (EOA & Proxy)**
 ```bash
 ./trade -info
 ```
@@ -109,9 +120,9 @@ Scans for risk-free arbs on a specific asset.
 | **Strategy Params** | | | |
 | `--dip` | Price drop % to trigger buy (0.15 = 15%) | 0.25 | `--dip=0.15` |
 | `--target` | Sum Target to exit (AvgYes + AvgNo) | 0.96 | `--target=0.98` |
-| `--shares` | Max shares per clip | 5 | `--shares=100` |
-| `--timeout` | Leg 2 max wait before Force Hedge (seconds) | 150 | `--timeout=60` |
-| `--window` | Sliding window for dip detection (ms) | 4000 | `--window=2000` |
+| `--shares` | Max shares per clip (subject to Risk Cap) | 5 | `--shares=100` |
+| `--timeout` | Leg 2 max wait before Force Hedge (seconds) | 60 | `--timeout=45` |
+| `--window` | Sliding window for dip detection (ms) | 3000 | `--window=2000` |
 | **Global** | | | |
 | `--verbose` | Enable debug logs | false | `--verbose` |
 | `--arb` | Switch to Atomic Arb Strategy | false | `--arb` |
@@ -128,11 +139,15 @@ If the bot accumulates Leg 1 (e.g., YES) but Leg 2 (NO) liquidity dries up, the 
     *   **Bypasses Risk Caps**: Uses 100% of available wallet to neutralize.
     *   **Bypasses WalletGuard**: Overrides safety checks to prioritize survival.
 
-### Partial Late Unwind
-Near market expiry (< 45s), if the bot holds a winning position that is dominant (> 70% odds):
-1.  **Sells Winner Leg**: Realizes profit immediately.
-2.  **Keeps Loser Leg**: Holds as a "free roll" (zero cost basis).
-3.  **Lock**: Disables further trading to prevent variance.
+### Liability-Based Sizing
+Risk is calculated based on **Total Liability ($1.00/share)**, not cost basis.
+*   **Cap**: 15% of Wallet (Standard) / 50% (Micro).
+*   **Min Size**: Automatically fetches and respects market-specific minimum order sizes (e.g. 5 shares).
+
+### State Machine Hardening
+*   **Strict Transitions**: `scanning` -> `complete` guards prevent infinite loops.
+*   **Auto-Cleanup**: Expired markets with 0 shares are cleanly removed from tracking.
+*   **Resumption**: Bot remembers its positions across restarts and re-attaches to live markets.
 
 ---
 

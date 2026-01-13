@@ -507,7 +507,14 @@ export class DipArbStrategy implements Strategy {
             // Better: Read PnL manager state.
             const stats = this.pnlManager.getAllStats();
             const startBal = stats.startingBalance;
-            const ddLimit = startBal < 20 ? 0.50 : 0.05;
+
+            // [TIERED DRAWDOWN]
+            // < $50  -> 50%
+            // < $100 -> 25%
+            // > $100 -> 10%
+            let ddLimit = 0.10;
+            if (startBal < 50) ddLimit = 0.50;
+            else if (startBal < 100) ddLimit = 0.25;
 
             if (this.pnlManager.checkDrawdown(ddLimit)) {
                 console.error(color(`\n💀 FATAL: DAILY DRAWDOWN LIMIT EXCEEDED (${(ddLimit * 100).toFixed(0)}%). SHUTTING DOWN.`, COLORS.BG_RED + COLORS.WHITE));
