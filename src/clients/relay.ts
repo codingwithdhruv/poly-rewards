@@ -1,8 +1,8 @@
 import { createWalletClient, http, Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
-import { RelayClient } from "@polymarket/builder-relayer-client";
-import { BuilderConfig } from "@polymarket/builder-signing-sdk";
+import { RelayClient, RelayerTxType } from "@polymarket/builder-relayer-client";
+import { BuilderConfig, BuilderApiKeyCreds } from "@polymarket/builder-signing-sdk";
 import { CONFIG } from "./config.js";
 
 export function createRelayClient(): RelayClient {
@@ -21,10 +21,24 @@ export function createRelayClient(): RelayClient {
         }
     });
 
-    return new RelayClient(
+    const client = new RelayClient(
         CONFIG.RELAYER_URL,
         CONFIG.CHAIN_ID,
         wallet,
-        builderConfig
+        builderConfig,
+        RelayerTxType.SAFE // Critical fix: Specify TxType
     );
+
+    // Verify Safe exists
+    // Note: This needs to be called, but createRelayClient is synchronous factory.
+    // We should move this check to initialization or main.
+    return client;
+}
+
+export async function verifySafeDeployment(provider: any, safeAddress: string) {
+    const code = await provider.getCode(safeAddress);
+    if (code === "0x") {
+        throw new Error(`Safe at ${safeAddress} is not deployed (code=0x)`);
+    }
+    console.log(`Safe ${safeAddress} verified on-chain.`);
 }

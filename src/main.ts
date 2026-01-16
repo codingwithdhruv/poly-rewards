@@ -1,10 +1,10 @@
 import { ethers } from "ethers";
 import { createClobClient } from "./clients/clob.js";
-import { createRelayClient } from "./clients/relay.js";
+import { createRelayClient, verifySafeDeployment } from "./clients/relay.js";
 import { parseCliArgs } from "./config/args.js";
-import { DipArbStrategy, DipArbConfig } from "./strategies/dipArb.js";
-import { TruePairArbStrategy } from "./strategies/TruePairArbStrategy.js";
+import { RewardsStrategy } from "./strategies/RewardsStrategy.js";
 import { Bot, BotConfig } from "./bot.js";
+import { CONFIG } from "./clients/config.js";
 import { PnlManager } from "./lib/pnlManager.js"; // Import PnlManager
 
 // --- UI Helpers for Dashboard ---
@@ -98,45 +98,31 @@ async function main() {
     }
 
     // --- NORMAL BOT MODE ---
-    console.log(`Starting Dip Arbitrage Bot for ${args.coin}...`);
-    console.log(`Config: Dip=${args.dipThreshold * 100}% Target=${args.sumTarget}`);
-
-    // ... (rest of bot init) ...
-    // NOTE: We need to reconstruct the Bot Init logic since we overwrote the file. 
-    // I will include the previous logic here.
-
-    // 1. Env Check
-    const rpcUrl = process.env.RPC_URL;
-    const privateKey = process.env.PRIVATE_KEY;
-    if (!rpcUrl || !privateKey) {
-        throw new Error("Missing RPC_URL or PRIVATE_KEY in .env");
-    }
-
-    // Await user confirmation if not verbose? No, just run.
-    console.log("Starting Bot...");
+    console.log(`Starting Bot...`);
 
     // 2. Clients
     console.log("Initializing local wallet and relay client...");
-    const wallet = new ethers.Wallet(privateKey);
-    const chainId = 137; // Polygon
-    const relayClient = createRelayClient(wallet, chainId);
+    // const wallet = ... (removed manual wallet creation as createRelayClient handles it)
+    const relayClient = createRelayClient(); // No args
+
+    if (CONFIG.POLY_PROXY_ADDRESS) {
+        // clob client creates provider internally but not exposed easy.
+        // use ethers provider from clob creation or make new one.
+        const provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
+        await verifySafeDeployment(provider, CONFIG.POLY_PROXY_ADDRESS);
+    }
 
     console.log("Initializing CLOB client...");
-    const clobClient = await createClobClient(rpcUrl, privateKey, chainId);
+    const clobClient = await createClobClient(); // No args
 
     // 3. Strategy
-    console.log(`Initializing strategy (${args.strategy || 'dip'})...`);
-    let strategy;
+    // 3. Strategy
+    console.log(`Initializing Rewards Strategy${args.custom ? ` [Custom Mode: "${args.custom}"]` : ""}...`);
+    const customSpread = args.mid ? Number(args.mid) / 100 : undefined;
+    const customAvoid = args.sl ? Number(args.sl) / 100 : undefined;
 
-    if (args.strategy === 'true-arb') {
-        strategy = new TruePairArbStrategy({
-            coin: args.coin,
-            maxRiskPct: 0.05, // Default safe configs or map from args if needed
-            // Map relevant args or rely on strategy defaults
-        });
-    } else {
-        strategy = new DipArbStrategy(args);
-    }
+    const strategy = new RewardsStrategy(args.custom, customSpread, customAvoid);
+
 
     // 4. Bot
     const config: BotConfig = {
@@ -145,13 +131,6 @@ async function main() {
     };
 
     // Handle --redeem special mode
-    if (args.redeem) {
-        console.log("REDEEM MODE: Checking for redeemable positions...");
-        // This would call strategy.redeem() if implemented, 
-        // or we could just use a redeem utility. 
-        // For now, let's just warn it's not fully implemented in Strategy yet or simple check.
-        // But the previous file handled it by passing args to strategy.
-    }
 
     const bot = new Bot(clobClient, relayClient, strategy, config);
     await bot.start();

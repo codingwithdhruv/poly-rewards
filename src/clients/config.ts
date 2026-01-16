@@ -13,16 +13,16 @@ const getEnvParam = (key: string): string => {
 export const CONFIG = {
     HOST: "https://clob.polymarket.com",
     RELAYER_URL: "https://relayer-v2.polymarket.com/",
-    CHAIN_ID: 137, // Polygon mainnet
+    CHAIN_ID: parseInt(process.env.Chain_ID || "137"),
     RPC_URL: getEnvParam("RPC_URL"),
     PRIVATE_KEY: getEnvParam("PRIVATE_KEY"),
-    POLY_BUILDER_API_KEY: process.env.POLY_BUILDER_API_KEY || getEnvParam("BUILDER_API_KEY"),
-    POLY_BUILDER_SECRET: process.env.POLY_BUILDER_SECRET || getEnvParam("BUILDER_SECRET"),
-    POLY_BUILDER_PASSPHRASE: process.env.POLY_BUILDER_PASSPHRASE || getEnvParam("BUILDER_PASS_PHRASE"),
+    POLY_BUILDER_API_KEY: getEnvParam("BUILDER_API_KEY"),
+    POLY_BUILDER_SECRET: getEnvParam("BUILDER_SECRET"),
+    POLY_BUILDER_PASSPHRASE: getEnvParam("BUILDER_PASS_PHRASE"),
 
     // Optional: Proxy / Gnosis Safe Configuration
     // If set, the bot will act as this proxy address
-POLY_PROXY_ADDRESS: process.env.POLY_PROXY_ADDRESS,
+    POLY_PROXY_ADDRESS: process.env.POLY_PROXY_ADDRESS,
 };
 
 export const isProxyEnabled = (): boolean => {

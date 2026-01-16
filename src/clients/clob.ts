@@ -30,12 +30,16 @@ export async function createClobClient(): Promise<ClobClient> {
     if (proxyAddress) {
         console.log(`[ClobClient] Using Proxy Address: ${proxyAddress} (SignatureType=2)`);
         // Gnosis Safe / Proxy Usage
+        // import { SignatureType } from "@polymarket/clob-client"; // Removed nested import
+
+        // ...
+
         return new ClobClient(
             CONFIG.HOST,
             chainId,
             signer,
             apiCreds,
-            2, // SignatureType.GnosisSafe (using const to avoid import issues for now)
+            2, // SignatureType.GnosisSafe
             proxyAddress
         );
     }

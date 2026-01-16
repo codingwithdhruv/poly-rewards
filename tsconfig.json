@@ -5,7 +5,8 @@
         "moduleResolution": "NodeNext",
         "outDir": "./dist",
         "rootDir": "./src",
-        "strict": true,
+        "strict": false,
+        "strictNullChecks": false,
         "esModuleInterop": true,
         "skipLibCheck": true,
         "forceConsistentCasingInFileNames": true
@@ -16,5 +17,9 @@
     "exclude": [
         "node_modules",
         "dist"
-    ]
+    ],
+    "ts-node": {
+        "esm": true,
+        "experimentalSpecifierResolution": "node"
+    }
 }

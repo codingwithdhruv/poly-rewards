@@ -1,155 +1,133 @@
-# 🦅 Poly-Addict
-> *High-Frequency Prediction Market Trading Suite for Polymarket (Polygon)*
+# 💰 Poly Rewards Bot
 
-**Poly-Addict** is an institutional-grade algorithmic trading bot engineered for the Polymarket ecosystem. It specializes in volatility harvesting ("The Gabagool") and atomic arbitrage, backed by robust safety mechanisms including WalletGuard™ and Proxy Integration.
-
----
-
-## 🚀 Features
-
-### 🧠 Strategic Engines
-1.  **The Gabagool (Dip Arbitrage)**
-    *   **Logic**: Exploits mean-reversion in binary markets. Accumulates heavily when spreads widen (panic dumps) and exits when they normalize.
-    *   **Dynamic Entry**: Sliding window analysis (default 3s) detects rapid price drops.
-    *   **Exit Waterfall**:
-        1.  **Sum Target Exit**: Closes both legs if `AskYes + AskNo <= Target` (e.g. 0.95).
-        2.  **Early Profit Lock**: Exits if `Mark-to-Market PnL > 10%`.
-        3.  **Late Dominance Exit**: Time-weighted exit if `Dominance > 70%` near expiry.
-        4.  **Partial Unwind**: Sells winner-only in last 45s to reduce risk while keeping upside.
-
-2.  **True Pair Arb (Atomic)**
-    *   **Logic**: Scans for instant risk-free arbitrage opportunities where `AskYes + AskNo < 1.00`.
-    *   **Safety**: Executes atomically or rolls back. Zero directional risk.
-
-### 🛡️ Safety Systems (Battle-Tested)
-*   **WalletGuard™**: Local semaphore preventing capital over-commitment. Ensures "In-Flight" orders don't exceed wallet capacity.
-*   **Tiered Risk Management**:
-    *   **Exposure Cap**: Max **15%** of wallet per market (Standard) / **50%** (Micro).
-    *   **Daily Drawdown**: Auto-shutdown if loss exceeds limit.
-        *   Micro (<$50): **50%**
-        *   Small (<$100): **25%**
-        *   Standard (>$100): **10%**
-*   **Force Hedge**: Automatically detects naked positions (failed leg 2). If timeout is reached, it panic-buys the missing leg to neutralize delta, even at a loss.
-*   **Cycle Resumption**: Smartly detects orphaned cycles on restart, re-attaches if active, or cleans up if expired.
-*   **Proxy Support**: Native integration for Gnosis Safe / Relayer execution (Gasless).
+A sophisticated, thesis-driven market making bot designed for **Polymarket Rewards Farming**. This bot focuses on "High Yield" opportunities, providing deep liquidity to reward-eligible markets while adhering to strict risk and scoring protocols.
 
 ---
 
-## 📦 Installation & Setup
+## 🚀 Key Strategies & Features
 
-### Prerequisites
-*   Node.js v16+ (v20+ recommended)
-*   Polygon RPC URL (Alchemy/Infura)
-*   Polymarket API Keys (Proxy or EOA)
+### 🧠 Logic & Scoring
+- **Yield Score Prioritization**: Markets are ranked by `Yield Score = DailyRewards / Competition`.
+  - The bot prioritizes markets where you get the "Most Rewards per Unit of Competition".
+- **Strict Tier 1 Focus**:
+  - Filters for "Tier 1" candidates (High Yield, Reasonable Spread).
+  - Skips "Tier 2/3" (Low Yield/Sniper) markets to maximize capital efficiency.
+- **Official API Midpoint**: 
+  - Uses `clobClient.getMidpoint()` instead of Orderbook estimation.
+  - Ensures quotes are aligned **exactly** with the Rewards Engine's reference price.
 
-### 1. Clone
+### 🎯 Custom Market Targeting (New)
+The bot supports a powerful **Custom Mode** to target *any* market, bypassing standard filters.
 ```bash
-git clone https://github.com/your-username/poly-addict.git
-cd poly-addict
+./trade -custom "S&P 500" --mid 2 --sl 1
 ```
+- **Unrestricted Access**: Bypasses `DailyRewards`, `Tier`, and `Resolution` checks. If you name it, the bot trades it.
+- **Smart Search**: If the market isn't in the standard rewards list, the bot searches the **Gamma API**, fetches CLOB details, and patches missing data (like Question strings) automatically.
+- **Custom Spreads**:
+  - `--mid X`: Places limit orders at `Mid +/- X` cents (Default: 1c).
+  - `--sl Y`: **Stoploss/Avoidance**. If price moves within `Y` cents of your order, it cancels.
 
-### 2. Install
+### 🛡️ Risk Management & Safeguards
+- **Fill Avoidance (Trailling Stop)**:
+  - Continuously monitors the "Distance to Mid".
+  - If the market moves against you (distance < `--sl` threshold), the bot **Cancels ALL Orders** on that market immediately.
+  - *Rule*: "If one side is threatened, close both." This prevents adverse selection on the resting leg.
+- **Pre-Trade Balance Checks**:
+  - **Collateral (USDC)**: Checks if you have enough funds *before* placing orders.
+  - **Shares (YES/NO)**: Checks if you actually own shares *before* attempting to SELL. Prevents "Insufficient Funds" errors.
+- **Dual-Sided Budgeting**:
+  - Calculates `Total Cost = (YesBid * Size) + (NoBid * Size)`.
+  - If `Total Cost > Balance`, it automatically **scales down** the order size.
+  - Ensures you always quote both sides (Delta Neutral) rather than being left with one naked leg.
+
+### 📊 UI & Observability
+- **Live Progress Counter**: A clean, overwriting counter (`Processing markets... 450/1000`) during scans.
+- **Granular Cost Table**:
+  - Displays `YesPx`, `NoPx`, `YCost` (Cost for Yes), `NCost` (Cost for No), and `TotCost` (Delta Neutral Total).
+  - Gives instant visibility into the capital required to hold a Delta Neutral position.
+- **Debug Logging**:
+  - Custom Mode prints detailed match info (Rewards, Tokens, EndDate).
+  - Explicitly confirms API data integrity (`[Custom Debug] Added...`).
+
+---
+
+## 🛠️ Setup Guide
+
+### 1. Prerequisites
+- **Node.js** (v18+)
+- **Gnosis Safe Proxy**: Required for gasless trading (Relayer).
+- **Polymarket API Keys**: For Proxy/Signer.
+
+### 2. Installation
 ```bash
+git clone <repo-url>
+cd poly-rewards
 npm install
 ```
 
-### 3. Environment Config
-Create a `.env` file in the root:
+### 3. Environment Variables
+Create a `.env` file:
 ```env
-# Required: RPC & Private Key
-RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY
-PRIVATE_KEY=0xYOUR_PRIVATE_KEY
-
-# Optional: Proxy Wallet (Gnosis Safe)
-# POLY_PROXY_ADDRESS=0xYOUR_PROXY_ADDRESS
-# POLY_CLOB_API_KEY=...
-# POLY_CLOB_SECRET=...
-# POLY_CLOB_PASSPHRASE=...
+PRIVATE_KEY=your_private_key
+BUILDER_API_KEY=your_key
+BUILDER_SECRET=your_secret
+BUILDER_PASS_PHRASE=your_passphrase
+POLY_PROXY_ADDRESS=0xYourProxyAddress
+Chain_ID=137
+DRY_RUN=false
 ```
 
 ---
 
-## 🎮 Quick Start
+## ⚙️ Configuration
+Configure `src/config/rewardsConfig.ts`:
 
-### 1. Run "The Gabagool" (Dip Buying)
-Continuously scans a specific coin market for dumps.
-
-**Basic (ETH)**
-```bash
-./trade eth
+### **Allocation**
+```typescript
+ALLOCATION: {
+    MAX_DEPLOYED_PERCENT: 0.80,  // Use 80% of balance
+    PER_MARKET_PERCENT: 0.80,    // Allocate heavily to top picks
+    MAX_ACTIVE_MARKETS: 1        // Focus on 1 high-yield market (Configurable)
+}
 ```
 
-**Aggressive (BTC)**
-```bash
-./trade btc --dip=0.15 --shares=500
-```
-
-**Defensive (XRP)**
-```bash
-./trade xrp --dip=0.40 --target=0.98 --shares=100
-```
-
-### 2. Run Atomic Arbitrage
-Scans for risk-free arbs on a specific asset.
-```bash
-./arb sol
-```
-
-### 3. Dashboards & Utilities
-**Live PnL Dashboard**
-```bash
-./trade -dashboard
-```
-**Check Wallet Balances (EOA & Proxy)**
-```bash
-./trade -info
-```
-**Redeem Winnings**
-```bash
-./trade -redeem
+### **Market Filters (Tier 1)**
+```typescript
+TIER_1: {
+    MIN_YIELD_SCORE: 50,         // High Rewards/Comp ratio
+    MIN_DAILY_REWARDS: 50,       // Minimum pool size
+    MIN_SHARES_TARGET: 500       // Liquidity depth target
+}
 ```
 
 ---
 
-## 🔧 Configuration Flags
+## 🏃‍♂️ Usage
 
-| Flag | Description | Default (ETH) | Example |
-| :--- | :--- | :--- | :--- |
-| **Asset Selection** | | | |
-| `--eth`, `--btc`, `--sol` | Selects target asset market | ETH | `./trade --btc` |
-| **Strategy Params** | | | |
-| `--dip` | Price drop % to trigger buy (0.15 = 15%) | 0.25 | `--dip=0.15` |
-| `--target` | Sum Target to exit (AvgYes + AvgNo) | 0.96 | `--target=0.98` |
-| `--shares` | Max shares per clip (subject to Risk Cap) | 5 | `--shares=100` |
-| `--timeout` | Leg 2 max wait before Force Hedge (seconds) | 60 | `--timeout=45` |
-| `--window` | Sliding window for dip detection (ms) | 3000 | `--window=2000` |
-| **Global** | | | |
-| `--verbose` | Enable debug logs | false | `--verbose` |
-| `--arb` | Switch to Atomic Arb Strategy | false | `--arb` |
+### **1. Standard Auto-Farming**
+Runs the strategy on the best available Reward Markets.
+```bash
+./trade
+```
 
----
-
-## 📚 Advanced Architecture
-
-### The "Force Hedge" Mechanism
-If the bot accumulates Leg 1 (e.g., YES) but Leg 2 (NO) liquidity dries up, the bot enters a **Naked Position** state.
-1.  **Timer Starts**: Configurable via `--timeout` (e.g. 60s).
-2.  **Detection**: If Leg 2 is missing after timeout.
-3.  **Action**: FORCE BUY Leg 2 at *any* price.
-    *   **Bypasses Risk Caps**: Uses 100% of available wallet to neutralize.
-    *   **Bypasses WalletGuard**: Overrides safety checks to prioritize survival.
-
-### Liability-Based Sizing
-Risk is calculated based on **Total Liability ($1.00/share)**, not cost basis.
-*   **Cap**: 15% of Wallet (Standard) / 50% (Micro).
-*   **Min Size**: Automatically fetches and respects market-specific minimum order sizes (e.g. 5 shares).
-
-### State Machine Hardening
-*   **Strict Transitions**: `scanning` -> `complete` guards prevent infinite loops.
-*   **Auto-Cleanup**: Expired markets with 0 shares are cleanly removed from tracking.
-*   **Resumption**: Bot remembers its positions across restarts and re-attaches to live markets.
+### **2. Custom Market Mode**
+Force the bot to trade a specific market with custom risk parameters.
+```bash
+./trade -custom "Market Name" --mid 2 --sl 1
+```
+- `-custom`: Search query (Case-insensitive).
+- `--mid 2`: Target Spread = 2 cents from Mid.
+- `--sl 1`: Cancel if price moves within 1 cent.
 
 ---
 
-## ⚠️ Disclaimer
-*Prediction markets are volatile. "Risk-free" arbitrage relies on atomic execution which depends on chain stability. Use at your own risk. The authors accept no liability for financial losses.*
+## 📂 Architecture
+- **`RewardsStrategy.ts`**: Core logic.
+  - `scanAndRotate()`: Yield Scoring, Gamma Search, Data Patching.
+  - `manageMarketOrders()`: Start/Cancel Orders, Budgeting.
+  - `runFillAvoidance()`: Stoploss Logic.
+- **`marketUtils.ts`**: Tier logic helpers.
+- **`gamma-api.ts`**: Data fetching & Search.
+
+## 📜 License
+MIT
