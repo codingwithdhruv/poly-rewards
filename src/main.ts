@@ -5,7 +5,7 @@ import { parseCliArgs } from "./config/args.js";
 import { RewardsStrategy } from "./strategies/RewardsStrategy.js";
 import { Bot, BotConfig } from "./bot.js";
 import { CONFIG } from "./clients/config.js";
-import { PnlManager } from "./lib/pnlManager.js"; // Import PnlManager
+
 
 // --- UI Helpers for Dashboard ---
 const COLORS = {
@@ -30,70 +30,7 @@ async function main() {
 
     // --- STANDALONE DASHBOARD MODE ---
     if (args.dashboard) {
-        console.clear();
-        console.log("Starting Standalone PnL Dashboard...");
-        const pnlManager = new PnlManager();
-
-        setInterval(() => {
-            console.clear();
-            const allStats = pnlManager.getAllStats();
-            const coins = ['BTC', 'ETH', 'XRP'];
-
-            console.log(color(`\n══════════════════════════════════════════════════════════`, COLORS.DIM));
-            console.log(color(`📊 POLYMARKET DIP ARB DASHBOARD (LIVE)`, COLORS.BRIGHT + COLORS.CYAN));
-            console.log(color(`══════════════════════════════════════════════════════════`, COLORS.DIM));
-
-            // Wallet
-            console.log(`Wallet:`);
-            console.log(`  Balance:        $${allStats.walletBalance.toFixed(2)}`);
-            let totalPnL = 0;
-            Object.values(allStats.coins).forEach(c => totalPnL += c.realizedPnL);
-            const pnlColor = totalPnL >= 0 ? COLORS.GREEN : COLORS.RED;
-            console.log(`  Net PnL (Session): ${color((totalPnL >= 0 ? "+" : "") + "$" + totalPnL.toFixed(2), pnlColor)}`);
-            console.log(`  Last Update:    ${new Date(allStats.lastUpdate).toLocaleTimeString()}`);
-            console.log("");
-
-            // Per Coin Stats
-            coins.forEach(c => {
-                const s = allStats.coins[c];
-                if (s) {
-                    const coinPnlColor = s.realizedPnL >= 0 ? COLORS.GREEN : COLORS.RED;
-                    // Check if Active Cycle exists for this coin
-                    let activeExp = 0;
-                    let activeCount = 0;
-                    Object.values(allStats.activeCycles).forEach(cycle => {
-                        if (cycle.coin === c && cycle.status === 'OPEN') {
-                            activeExp += (cycle.yesCost + cycle.noCost);
-                            activeCount++;
-                        }
-                    });
-
-                    const status = activeCount > 0 ? color("ACTIVE", COLORS.GREEN) : "WATCHING";
-
-                    console.log(`${c}:`);
-                    console.log(`  Cycles:   ${s.cyclesCompleted} | Wins: ${s.cyclesWon} | Fails: ${s.cyclesLost + s.cyclesAbandoned}`);
-                    console.log(`  PnL:      ${color((s.realizedPnL >= 0 ? "+" : "") + "$" + s.realizedPnL.toFixed(2), coinPnlColor)}`);
-                    console.log(`  Exposure: $${activeExp.toFixed(2)}`);
-                    console.log(`  Status:   ${status}`);
-                    console.log("");
-                } else {
-                    console.log(`${c}: ${color("No Data", COLORS.DIM)}\n`);
-                }
-            });
-
-            console.log(color(`══════════════════════════════════════════════════════════`, COLORS.DIM));
-            console.log(color(`[Active Cycles]`, COLORS.YELLOW));
-            if (Object.keys(allStats.activeCycles).length === 0) {
-                console.log(color("  No active cycles.", COLORS.DIM));
-            } else {
-                Object.values(allStats.activeCycles).forEach(c => {
-                    console.log(`  • ${c.coin} ${c.id.split('-').slice(-4).join('-')} [Exp: $${(c.yesCost + c.noCost).toFixed(2)}]`);
-                });
-            }
-
-        }, 1000); // 1s refresh
-
-        // Prevent exit
+        console.log("Dashboard removed: Use the poly-rewards bot normally which logs status.");
         return;
     }
 
@@ -130,7 +67,7 @@ async function main() {
         logIntervalMs: 5000
     };
 
-    // Handle --redeem special mode
+    // 4. Bot
 
     const bot = new Bot(clobClient, relayClient, strategy, config);
     await bot.start();

@@ -9,7 +9,7 @@ export const REWARDS_CONFIG = {
         MAX_COMPETITION_BARS: 10,    // Ignored
         MIN_DAILY_REWARDS: 50,
         MIN_SHARES_PREFER: 10,
-        MIN_SHARES_TARGET: 500,      // Relaxed from 10 to catch big campaigns
+        MIN_SHARES_TARGET: 199,      // < 200 as requested
         MAX_RESOLUTION_HOURS: 24 * 365,
         MAX_SPREAD_CENTS: 10,        // Relaxed from 5 to 10
         MIN_MID_PRICE: 0.05,
@@ -19,7 +19,7 @@ export const REWARDS_CONFIG = {
         MIN_YIELD_SCORE: 15,         // Good Payout per Dollar
         MAX_COMPETITION_BARS: 10,    // Ignored
         MIN_DAILY_REWARDS: 20,
-        MIN_SHARES_TARGET: 500,      // Relaxed
+        MIN_SHARES_TARGET: 199,      // < 200 as requested
         MAX_RESOLUTION_DAYS: 365 * 2,
         MAX_SPREAD_CENTS: 10,        // Relaxed
         MIN_MID_PRICE: 0.05,

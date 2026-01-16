@@ -438,6 +438,10 @@ export class RewardsStrategy implements Strategy {
                             }]
                         };
 
+                        if (minShares >= 200) {
+                            console.warn(`[Debug Warning] Market ${market.question.slice(0, 20)} has shares ${minShares} >= 200, should be filtered by T1/T2 check!`);
+                        }
+
                         const tickStr = String(market.minimum_tick_size || "0.01");
                         const tickSize = tickStr as TickSize;
 
@@ -625,11 +629,8 @@ export class RewardsStrategy implements Strategy {
                 // CHECK 1: GLOBAL SPREAD TOO TIGHT?
                 // User Rule: "cancel all limits if gap gets less than 0.2c either side" (Implies tight compressed market)
                 // We use a safe floor. If spread drops below our STOPLOSS (or 0.2c default), we are in danger.
-                // If distThreshold is 0.002,                // CHECK 1: GLOBAL SPREAD TOO TIGHT?
-                if (currentSpread < distThreshold) {
-                    this.logAction(state.gammaMarket.question, "COMPRESS", currentSpread, -1, distThreshold, `CRITICAL: Spread < SL. Cancelling ALL.`);
-                    triggered = true;
-                }
+                // CHECK 1: GLOBAL SPREAD TOO TIGHT? - REMOVED (User only wants distance check)
+                // if (currentSpread < distThreshold) { ... }
 
                 // CHECK 2: INDIVIDUAL ORDERS TOO CLOSE?
                 if (!triggered) {
@@ -767,7 +768,8 @@ export class RewardsStrategy implements Strategy {
                     if (targetOffset > maxAllowable) targetOffset = maxAllowable;
                 }
                 // Constraint: Minimum 1 tick
-                if (targetOffset < 0.01) targetOffset = 0.01;
+                const minTick = Number(state.tickSize) || 0.01;
+                if (targetOffset < minTick) targetOffset = minTick;
 
                 this.logAction(state.gammaMarket.question, "REQUOTE", currentSpread, targetOffset, -1, `Max: ${state.rewardsMaxSpread ? state.rewardsMaxSpread.toFixed(3) : "None"}`);
             }
