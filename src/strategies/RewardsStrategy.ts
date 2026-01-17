@@ -974,6 +974,8 @@ export class RewardsStrategy implements Strategy {
             for (const cand of sortedByCES) {
                 // Check if we can afford the WORST CASE execution
                 if (remainingBalance >= (cand.minCapitalRequired || 0)) {
+                    // FIX: Explicitly reserve capital so manageMarketOrders knows we approved this
+                    (cand as any)._reservedCapital = cand.minCapitalRequired;
                     selectedMarkets.push(cand);
                     remainingBalance -= (cand.minCapitalRequired || 0);
                     // Phase 17: Don't break, keep trying to fit smaller gems
