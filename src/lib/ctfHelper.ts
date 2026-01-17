@@ -5,8 +5,8 @@ import { createWalletClient, http, Hex, encodeFunctionData, parseUnits } from "v
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 
-const CTF_ADDRESS = "0x4D9702590A32765082a7371D50D618d6a87071fA"; // Polygon CTF
-const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC.e on Polygon
+const CTF_ADDRESS = "0x4D97DCd97eC945f40cf65F87097ACe5EA0476045"; // Polygon CTF (EIP-55 checksummed)
+const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"; // USDC.e on Polygon (already correct)
 
 const CTF_ABI = [
     "function mergePositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] partition, uint256 amount)"
