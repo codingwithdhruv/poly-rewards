@@ -897,7 +897,8 @@ export class RewardsStrategy implements Strategy {
             const availableForTrading = Number((await this.clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })).balance) / 1e6; // Refresh balance
 
             // Phase 17 Issue #1: Wallet-Aware Selection (Pre-filter poison markets)
-            const MAX_ACCEPTABLE_MIN_SHARES = availableForTrading < 150 ? 50 : (availableForTrading < 300 ? 100 : 200);
+            // Adjusted: <$100 -> 50, <$200 -> 100, else 200
+            const MAX_ACCEPTABLE_MIN_SHARES = availableForTrading < 100 ? 50 : (availableForTrading < 200 ? 100 : 200);
 
             // Filter out markets too large for this wallet
             const walletAdjustedCandidates = validCandidates.filter(c => {
