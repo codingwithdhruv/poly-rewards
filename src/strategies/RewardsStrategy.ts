@@ -205,8 +205,14 @@ export class RewardsStrategy implements Strategy {
             try {
                 const strData = data.toString();
 
+                // Phase 23: Handle PING/PONG keep-alive messages
                 if (strData === "PING" || strData === "ping") {
                     this.ws?.send("PONG");
+                    return;
+                }
+
+                if (strData === "PONG" || strData === "pong") {
+                    // Server acknowledged our PING, ignore
                     return;
                 }
 
