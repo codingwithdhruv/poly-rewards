@@ -1,5 +1,5 @@
 import { ethers } from "ethers";
-import { CONFIG } from "../clients/config.js";
+import { CONFIG } from "../clients/config";
 import { RelayClient } from "@polymarket/builder-relayer-client";
 import { createWalletClient, http, Hex, encodeFunctionData, parseUnits } from "viem";
 import { privateKeyToAccount } from "viem/accounts";

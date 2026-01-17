@@ -3,7 +3,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 import { RelayClient, RelayerTxType } from "@polymarket/builder-relayer-client";
 import { BuilderConfig, BuilderApiKeyCreds } from "@polymarket/builder-signing-sdk";
-import { CONFIG } from "./config.js";
+import { CONFIG } from "./config";
 
 export function createRelayClient(): RelayClient {
     const account = privateKeyToAccount(CONFIG.PRIVATE_KEY as Hex);

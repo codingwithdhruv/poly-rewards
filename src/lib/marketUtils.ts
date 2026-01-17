@@ -1,5 +1,5 @@
-import { REWARDS_CONFIG } from "../config/rewardsConfig.js";
-import { GammaMarket } from "../clients/gamma-api.js";
+import { REWARDS_CONFIG } from "../config/rewardsConfig";
+import { GammaMarket } from "../clients/gamma-api";
 
 /**
  * Calculates the score for a market based on the formula:

@@ -1,16 +1,16 @@
 import { ClobClient, OrderType, Side, TickSize, MarketReward, AssetType, ApiKeyCreds } from "@polymarket/clob-client";
 import { RelayClient } from "@polymarket/builder-relayer-client";
-import { Strategy } from "./types.js";
-import { GammaClient, GammaMarket } from "../clients/gamma-api.js";
-import { REWARDS_CONFIG } from "../config/rewardsConfig.js";
-import { CONFIG } from "../clients/config.js";
-import * as MarketUtils from "../lib/marketUtils.js";
+import { Strategy } from "./types";
+import { GammaClient, GammaMarket } from "../clients/gamma-api";
+import { REWARDS_CONFIG } from "../config/rewardsConfig";
+import { CONFIG } from "../clients/config";
+import * as MarketUtils from "../lib/marketUtils";
 import { ethers } from "ethers";
 import WebSocket from "ws";
-import * as ScoringCalc from "../lib/scoringCalculator.js";
-import { analyzeLiquidity, calculateAsymmetricDistances, analyzeDepthBands, DepthBands } from "../lib/orderbookAnalyzer.js";
-import * as OrderbookAnalyzer from "../lib/orderbookAnalyzer.js"; // Helper to get types if needed
-import { mergePositions } from "../lib/ctfHelper.js";
+import * as ScoringCalc from "../lib/scoringCalculator";
+import { analyzeLiquidity, calculateAsymmetricDistances, analyzeDepthBands, DepthBands } from "../lib/orderbookAnalyzer";
+import * as OrderbookAnalyzer from "../lib/orderbookAnalyzer"; // Helper to get types if needed
+import { mergePositions } from "../lib/ctfHelper";
 
 interface TrackedOrder {
     orderId: string;

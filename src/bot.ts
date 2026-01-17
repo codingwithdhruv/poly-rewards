@@ -1,6 +1,6 @@
 import { ClobClient } from "@polymarket/clob-client";
 import { RelayClient } from "@polymarket/builder-relayer-client";
-import { Strategy } from "./strategies/types.js";
+import { Strategy } from "./strategies/types";
 
 export interface BotConfig {
     scanIntervalMs: number;
