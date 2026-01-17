@@ -1,10 +1,10 @@
 import { ethers } from "ethers";
-import { createClobClient } from "./clients/clob";
-import { createRelayClient, verifySafeDeployment } from "./clients/relay";
-import { parseCliArgs } from "./config/args";
-import { RewardsStrategy } from "./strategies/RewardsStrategy";
-import { Bot, BotConfig } from "./bot";
-import { CONFIG } from "./clients/config";
+import { createClobClient } from "./clients/clob.js";
+import { createRelayClient, verifySafeDeployment } from "./clients/relay.js";
+import { parseCliArgs } from "./config/args.js";
+import { RewardsStrategy } from "./strategies/RewardsStrategy.js";
+import { Bot, BotConfig } from "./bot.js";
+import { CONFIG } from "./clients/config.js";
 
 
 // --- UI Helpers for Dashboard ---

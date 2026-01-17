@@ -1,6 +1,6 @@
 import { ClobClient } from "@polymarket/clob-client";
 import { Wallet } from "ethers";
-import { CONFIG } from "./config";
+import { CONFIG } from "./config.js";
 
 import { providers } from "ethers";
 
