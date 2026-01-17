@@ -956,7 +956,8 @@ export class RewardsStrategy implements Strategy {
                 const worstYes = Math.min((c.yesPrice ?? 0.5) + maxSpread, 0.999);
                 const worstNo = Math.min((c.noPrice ?? 0.5) + maxSpread, 0.999);
 
-                const effectiveMinCap = c.rewardsMinSize * (worstYes + worstNo) * 1.05; // 5% buffer on top of worst case
+                // Phase 25: Relax buffer from 1.05 to 1.02 for small wallets
+                const effectiveMinCap = c.rewardsMinSize * (worstYes + worstNo) * 1.02;
                 c.minCapitalRequired = effectiveMinCap;
                 if (effectiveMinCap > globalMaxCapReq) globalMaxCapReq = effectiveMinCap;
             });
@@ -965,24 +966,19 @@ export class RewardsStrategy implements Strategy {
             // Sort by CES (Small Wallet Gems are already boosted 2x in validCandidates loop)
             const sortedByCES = [...walletAdjustedCandidates].sort((a, b) => (b.capitalEfficiencyScore || 0) - (a.capitalEfficiencyScore || 0));
 
-            const selectedMarkets: MarketState[] = [];
             // Use fresh availableForTrading derived above
             let remainingBalance = availableForTrading;
-
             const ABSOLUTE_MAX_MARKETS = REWARDS_CONFIG.ALLOCATION.MAX_ACTIVE_MARKETS || 5;
 
-            for (const m of sortedByCES) {
-                // HARD invariant: must afford full two-sided minShares (already calc'd in c.minCapitalRequired with 1.05 boost)
-                const cap = m.minCapitalRequired || Infinity;
-
-                if (remainingBalance >= cap) {
-                    (m as any)._reservedCapital = cap;
-                    selectedMarkets.push(m);
-                    remainingBalance -= cap;
+            const selectedMarkets: MarketState[] = [];
+            for (const cand of sortedByCES) {
+                // Check if we can afford the WORST CASE execution
+                if (remainingBalance >= (cand.minCapitalRequired || 0)) {
+                    selectedMarkets.push(cand);
+                    remainingBalance -= (cand.minCapitalRequired || 0);
+                    // Phase 17: Don't break, keep trying to fit smaller gems
                 } else {
-                    // Stop immediately if we can't afford the next best market.
-                    // Do NOT skip to smaller ones, as that fragments capital on lower quality markets.
-                    break;
+                    console.log(`[Capital Routing] Skipping ${cand.gammaMarket.question.substring(0, 30)}... Req: $${(cand.minCapitalRequired || 0).toFixed(2)} > Rem: $${remainingBalance.toFixed(2)}`);
                 }
 
                 if (selectedMarkets.length >= ABSOLUTE_MAX_MARKETS) {
@@ -990,7 +986,7 @@ export class RewardsStrategy implements Strategy {
                 }
             }
 
-            console.log(`[Capital Routing] Balance: $${availableUSDC.toFixed(2)} | Selected: ${selectedMarkets.length} | Remaining: $${remainingBalance.toFixed(2)}`);
+            console.log(`[Capital Routing] Balance: $${availableUSDC.toFixed(2)} | Selected: ${selectedMarkets.length} | Remaining: $${remainingBalance.toFixed(2)} `);
             selectedMarkets.forEach(m => console.log(`  -> Picked: ${m.gammaMarket.question.slice(0, 30)}... (CES: ${m.capitalEfficiencyScore?.toFixed(1)}, MinCap: $${m.minCapitalRequired})`));
 
             const topMarkets = selectedMarkets;
@@ -1022,12 +1018,12 @@ export class RewardsStrategy implements Strategy {
                     const isManaging = state.mode === "MANAGING";
 
                     if (hasInventory || isManaging) {
-                        console.log(`[PROTECTED] Keeping ${state.gammaMarket.question.slice(0, 40)} - has inventory (YES: ${state.inventory?.yes?.toFixed(2) || 0}, NO: ${state.inventory?.no?.toFixed(2) || 0})`);
+                        console.log(`[PROTECTED] Keeping ${state.gammaMarket.question.slice(0, 40)} - has inventory(YES: ${state.inventory?.yes?.toFixed(2) || 0}, NO: ${state.inventory?.no?.toFixed(2) || 0})`);
                         newActiveMarkets.set(id, state);  // Keep it in active markets
                         continue;
                     }
 
-                    console.log(`Rotating out market: ${state.gammaMarket.question}`);
+                    console.log(`Rotating out market: ${state.gammaMarket.question} `);
                     await this.cancelMarketOrders(state);
                 }
             }
@@ -1113,7 +1109,7 @@ export class RewardsStrategy implements Strategy {
                 if (volatility > (freezeThreshold * 0.5)) { // Start expanding at 50% of freeze
                     const volMultiplier = 1 + (volatility / freezeThreshold); // Up to 2x distance
                     distThreshold = distThresholdBase * volMultiplier;
-                    // this.logAction(state.gammaMarket.question, "ADAPT", -1, -1, distThreshold, `Expanded threshold due to vol: ${volatility.toFixed(4)}`);
+                    // this.logAction(state.gammaMarket.question, "ADAPT", -1, -1, distThreshold, `Expanded threshold due to vol: ${ volatility.toFixed(4) } `);
                 }
 
                 // Phase 5: Temporal Alpha (Tighter stoploss during low activity)
@@ -1145,7 +1141,7 @@ export class RewardsStrategy implements Strategy {
                         const hardLimit = Math.max(absoluteFloor, distThreshold * 0.15);
 
                         if (dist <= hardLimit) {
-                            this.logAction(state.gammaMarket.question, "DRIFT", -1, -1, hardLimit, `HARD DRIFT: ${order.price} vs ${mid.toFixed(4)}. Dist ${dist.toFixed(4)}`);
+                            this.logAction(state.gammaMarket.question, "DRIFT", -1, -1, hardLimit, `HARD DRIFT: ${order.price} vs ${mid.toFixed(4)}. Dist ${dist.toFixed(4)} `);
                             triggered = true;
                             break; // Emergency Kill
                         }
@@ -1153,14 +1149,14 @@ export class RewardsStrategy implements Strategy {
                         if (dist <= softLimit) {
                             // Soft Drift - Check Grace Period
                             if (age > REWARDS_CONFIG.FILL_AVOIDANCE.MIN_QUOTE_LIFETIME_MS) {
-                                this.logAction(state.gammaMarket.question, "DRIFT", -1, -1, softLimit, `SOFT DRIFT (Expired Grace): ${order.price} vs ${mid.toFixed(4)}. Age ${age}ms`);
+                                this.logAction(state.gammaMarket.question, "DRIFT", -1, -1, softLimit, `SOFT DRIFT(Expired Grace): ${order.price} vs ${mid.toFixed(4)}. Age ${age} ms`);
                                 triggered = true;
                                 break;
                             } else {
                                 // Grace Period - Do NOT cancel
                                 // Log occasionally?
                                 if (Math.random() < 0.05) {
-                                    // console.log(`[Rewards] Soft Drift Grace for ${state.gammaMarket.question.slice(0, 20)}: Dist ${dist.toFixed(4)} < ${softLimit.toFixed(4)} but Age ${age}ms < 30s`);
+                                    // console.log(`[Rewards] Soft Drift Grace for ${ state.gammaMarket.question.slice(0, 20) }: Dist ${ dist.toFixed(4) } <${ softLimit.toFixed(4) } but Age ${ age } ms < 30s`);
                                 }
                             }
                         }
@@ -1187,7 +1183,7 @@ export class RewardsStrategy implements Strategy {
                 }
 
             } catch (e) {
-                console.error(`Fill avoidance check failed for ${id}:`, e);
+                console.error(`Fill avoidance check failed for ${id}: `, e);
             }
         }
     }
@@ -1207,7 +1203,7 @@ export class RewardsStrategy implements Strategy {
 
                 // Check available funds
                 if (parseFloat(balRes.balance) < 5) { // Minimum $5 safety
-                    this.logAction(state.gammaMarket.question, "LOW FUNDS", -1, -1, -1, `Balance ${balRes.balance} too low. Pausing 2m.`);
+                    this.logAction(state.gammaMarket.question, "LOW FUNDS", -1, -1, -1, `Balance ${balRes.balance} too low.Pausing 2m.`);
                     this.lowBalancePauseUntil = Date.now() + 120000;
                     return;
                 }
@@ -1234,7 +1230,7 @@ export class RewardsStrategy implements Strategy {
                     budgetPerMarket = Math.min(budgetPerMarket, REWARDS_CONFIG.ALLOCATION.MAX_BUDGET_PER_MARKET);
                 }
 
-                console.log(`[Balance] Total: $${availableUSDC.toFixed(2)}, Budget/Mkt: $${budgetPerMarket.toFixed(2)}, Required: ~$${(state.rewardsMinSize * 0.5).toFixed(2)}`);
+                console.log(`[Balance] Total: $${availableUSDC.toFixed(2)}, Budget / Mkt: $${budgetPerMarket.toFixed(2)}, Required: ~$${(state.rewardsMinSize * 0.5).toFixed(2)} `);
 
                 if (budgetPerMarket < 5) {
                     this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Budget per market $${budgetPerMarket.toFixed(2)} too low.`);
@@ -1244,7 +1240,7 @@ export class RewardsStrategy implements Strategy {
                 // FIX 2: Hard-Gate Budget against MinCapitalRequired
                 const minCapital = state.minCapitalRequired || (state.rewardsMinSize * ((state.yesCost || 0.5) + (state.noCost || 0.5)));
                 if (budgetPerMarket < minCapital) {
-                    this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Budget $${budgetPerMarket.toFixed(2)} < MinCapital $${minCapital.toFixed(2)}. Cannot meet minShares.`);
+                    this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Budget $${budgetPerMarket.toFixed(2)} <MinCapital $${minCapital.toFixed(2)}. Cannot meet minShares.`);
                     return;
                 }
 
@@ -1298,7 +1294,7 @@ export class RewardsStrategy implements Strategy {
 
                 if (affordableShares < requiredSharesForLadder) {
                     useLadder = false;
-                    // this.logAction(state.gammaMarket.question, "LADDER_OFF", -1, -1, -1, `Budget supports ${Math.floor(affordableShares)} shares < Required ${requiredSharesForLadder}. Single Order.`);
+                    // this.logAction(state.gammaMarket.question, "LADDER_OFF", -1, -1, -1, `Budget supports ${ Math.floor(affordableShares) } shares < Required ${ requiredSharesForLadder }. Single Order.`);
                 }
             }
 
@@ -1392,7 +1388,7 @@ export class RewardsStrategy implements Strategy {
                             const rate = deltaDepth / deltaTimeSeciles;
                             if (rate > (LP_CONFIG.REPLENISH_THRESHOLD_USDC_PER_SEC || 99999)) {
                                 isReplenishingFast = true;
-                                // console.log(`[Replenish] Firing! Rate $${rate.toFixed(0)}/s > Threshold`);
+                                // console.log(`[Replenish] Firing! Rate $${ rate.toFixed(0) }/s > Threshold`);
                             }
                         }
                     }
