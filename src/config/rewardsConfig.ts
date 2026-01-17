@@ -131,5 +131,18 @@ export const REWARDS_CONFIG = {
     // 1️⃣1️⃣ Global Safety
     SAFETY: {
         MIN_TOTAL_DAILY_REWARDS: 10.0,
+    },
+
+    // 8️⃣ Liquidity Pressure (Phase 8)
+    LIQUIDITY_PRESSURE: {
+        ENABLE_DYNAMIC_DISTANCING: true,
+        DEPTH_CHECK_INTERVAL_MS: 5000,
+        MIN_DEPTH_USDC: 1000, // Minimum cumulative size to consider "thick"
+        DISTANCES: {
+            AGGRESSIVE: 0.005, // 0.5¢
+            MODERATE: 0.010,   // 1.0¢
+            DEFENSIVE: 0.015   // 1.5¢
+        },
+        HYSTERESIS_CYCLES: 2   // Cycles to sustain before changing
     }
 };

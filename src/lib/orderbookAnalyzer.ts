@@ -145,3 +145,67 @@ export function getQuotingStrategy(
         distances
     };
 }
+
+// Phase 8: Liquidity Pressure - Depth Band Analysis
+export interface DepthBands {
+    layer1: number; // Size within 0.5¢
+    layer2: number; // Size within 1.0¢
+    layer3: number; // Size within 1.5¢
+}
+
+/**
+ * Analyze orderbook depth bands for liquidity pressure detection
+ * 
+ * @param orderbook - Orderbook data
+ * @param mid - Current midpoint price
+ * @returns Depth bands for bids (our side) and asks (counter side) relative to mid
+ */
+export function analyzeDepthBands(orderbook: Orderbook, mid: number): { bids: DepthBands, asks: DepthBands } {
+    const result = {
+        bids: { layer1: 0, layer2: 0, layer3: 0 },
+        asks: { layer1: 0, layer2: 0, layer3: 0 }
+    };
+
+    if (!orderbook || !orderbook.bids || !orderbook.asks) return result;
+
+    // BIDS (Buy Side)
+    for (const bid of orderbook.bids) {
+        const price = Number(bid.price);
+        const dist = Math.abs(mid - price);
+        const size = Number(bid.size);
+        const value = size * price; // Approx USDC value
+
+        // Using slight buffers to catch floating point edge cases
+        if (dist <= 0.0055) { // 0.5c
+            result.bids.layer1 += value;
+            result.bids.layer2 += value;
+            result.bids.layer3 += value;
+        } else if (dist <= 0.0105) { // 1.0c
+            result.bids.layer2 += value;
+            result.bids.layer3 += value;
+        } else if (dist <= 0.0155) { // 1.5c
+            result.bids.layer3 += value;
+        }
+    }
+
+    // ASKS (Sell Side)
+    for (const ask of orderbook.asks) {
+        const price = Number(ask.price);
+        const dist = Math.abs(price - mid);
+        const size = Number(ask.size);
+        const value = size * price; // Approx USDC value
+
+        if (dist <= 0.0055) { // 0.5c
+            result.asks.layer1 += value;
+            result.asks.layer2 += value;
+            result.asks.layer3 += value;
+        } else if (dist <= 0.0105) { // 1.0c
+            result.asks.layer2 += value;
+            result.asks.layer3 += value;
+        } else if (dist <= 0.0155) { // 1.5c
+            result.asks.layer3 += value;
+        }
+    }
+
+    return result;
+}

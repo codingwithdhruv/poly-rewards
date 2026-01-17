@@ -8,7 +8,8 @@ import * as MarketUtils from "../lib/marketUtils.js";
 import { ethers } from "ethers";
 import WebSocket from "ws";
 import * as ScoringCalc from "../lib/scoringCalculator.js";
-import * as OrderbookAnalyzer from "../lib/orderbookAnalyzer.js";
+import { analyzeLiquidity, calculateAsymmetricDistances, analyzeDepthBands, DepthBands } from "../lib/orderbookAnalyzer.js";
+import * as OrderbookAnalyzer from "../lib/orderbookAnalyzer.js"; // Helper to get types if needed
 import { mergePositions } from "../lib/ctfHelper.js";
 
 interface TrackedOrder {
@@ -45,6 +46,11 @@ interface MarketState {
     yesCost?: number;
     noCost?: number;
     dynamicStoploss?: number; // Store the calculated SL for this batch
+    minCapitalRequired?: number; // New: Min shares * (Yes + No prices)
+    capitalEfficiencyScore?: number; // New: Rewards / MinCapital
+    dailyRewards?: number; // For Gem detection
+    competition?: number;  // For Gem detection
+
 
     // Inventory & Mode Tracking
     mode: BotMode;
@@ -53,6 +59,13 @@ interface MarketState {
         no: number;
     };
     lastFillTime?: number;
+    // Phase 8: Liquidity Pressure State
+    pressureState?: {
+        yesDistance: number;
+        noDistance: number;
+        yesExhaustionCycles: number; // Consecutive cycles with low depth
+        noExhaustionCycles: number;
+    };
 }
 
 
@@ -80,6 +93,7 @@ export class RewardsStrategy implements Strategy {
     // Phase 5 & 6: Temporal & Performance
     private lastDashboardLogTime = 0;
     private lastScoringCheckTime = 0;
+    private globalTrackingBalance = 0; // Fix 2: Global liquidity tracking
     private marketStats: Map<string, {
         fills: number,
         lastFills: number,
@@ -360,6 +374,14 @@ export class RewardsStrategy implements Strategy {
                 const now = Date.now();
                 loopCount++;
 
+                // FIX 2: Refresh Global Liquidity
+                try {
+                    const bal = await this.clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+                    this.globalTrackingBalance = parseFloat(bal.balance) / 1e6;
+                } catch (e) {
+                    // keep previous balance if fail
+                }
+
                 // Reprint header occasionally (every 20 loops)
                 if (loopCount % 20 === 0) this.printLogHeader();
 
@@ -384,14 +406,27 @@ export class RewardsStrategy implements Strategy {
                     this.lastScoringCheckTime = now;
                     for (const [mid, state] of this.activeMarkets.entries()) {
                         try {
-                            if (state.orders.length === 0) continue;
-                            const scoringRes = await this.clobClient.areOrdersScoring({ orderIds: state.orders.map(o => o.orderId) });
-                            const isScoring = scoringRes.scoring; // Assuming the response has a scoring boolean
+                            // FIX 1: Filter to BUY orders only (SELLs don't reliably score)
+                            const scoringOrders = state.orders.filter(o => o.side === Side.BUY);
+                            if (scoringOrders.length === 0) continue;
+
+                            const scoringRes = await this.clobClient.areOrdersScoring({ orderIds: scoringOrders.map(o => o.orderId) });
+                            const scoringMap = (scoringRes as any).scoring || scoringRes; // Handle both structures
+
+                            // Check if ANY of our orders are scoring
+                            let scoringCount = 0;
+                            const orderIds = scoringOrders.map(o => o.orderId);
+                            for (const id of orderIds) {
+                                if (scoringMap[id] === true) scoringCount++;
+                            }
+
+                            const isScoring = scoringCount === orderIds.length; // True only if ALL are scoring
                             const stats = this.marketStats.get(mid) || { fills: 0, lastFills: 0, startTime: now, cumulativeRewards: 0, isScoring: true };
                             stats.isScoring = isScoring;
                             this.marketStats.set(mid, stats);
+
                             if (!isScoring) {
-                                this.logAction(state.gammaMarket.question, "PENALTY", -1, -1, -1, "Orders not scoring rewards!");
+                                this.logAction(state.gammaMarket.question, "PENALTY", -1, -1, -1, `⚠️ Only ${scoringCount}/${orderIds.length} orders are SCORING`);
                             }
                         } catch (e) { /* ignore */ }
                     }
@@ -516,7 +551,20 @@ export class RewardsStrategy implements Strategy {
             // 1. Fetch official Rewards Data from CLOB (Source of Truth)
             const rewardMap = await this.fetchClobRewards();
 
-            console.log(`Processing ${rewardMap.size} markets from CLOB...`);
+            // Fetch Balance for Capital Awareness
+            let availableUSDC = 0;
+            try {
+                const balRes = await this.clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+                availableUSDC = parseFloat(balRes.balance) / 1e6;
+            } catch (e) {
+                console.error("Failed to fetch balance during scan:", e);
+                // Fallback: If we can't get balance, assume we have some (or 0 to be safe, but 0 blocks everything)
+                // Let's assume we can proceed but with caution? Or maybe just skip filtering if fails?
+                // Better to skip filtering if balance fetch fails to avoid bricking.
+                availableUSDC = 999999;
+            }
+
+            console.log(`Processing ${rewardMap.size} markets from CLOB... | Balance: $${availableUSDC.toFixed(2)}`);
 
             const candidates: MarketState[] = [];
             let processed = 0;
@@ -598,6 +646,21 @@ export class RewardsStrategy implements Strategy {
                 const rawSpreadCtx = market.rewards?.max_spread !== undefined ? Number(market.rewards.max_spread) : undefined;
                 const maxSpread = rawSpreadCtx !== undefined ? rawSpreadCtx / 100 : undefined;
 
+                // CAPITAL AWARENESS CHECK
+                // Cost to hold minShares of (YES + NO) = minShares * 1.0 (approx)
+                const minCapitalRequired = minShares;
+
+                if (minCapitalRequired > availableUSDC * 0.95) {
+                    if (dailyRewards > 100 && processed <= 10) {
+                        console.log(`[Capital Reject] ${market.question.slice(0, 40)} | MinCap: $${minCapitalRequired} > Balance: $${availableUSDC.toFixed(2)}`);
+                    }
+                    continue;
+                }
+
+                // CAPITAL EFFICIENCY SCORE (CES)
+                const capitalEfficiencyScore = dailyRewards / minCapitalRequired;
+
+
                 // 3. Fetch Orderbook & Metrics
                 try {
                     // Use OFFICIAL getMidpoint API
@@ -632,9 +695,17 @@ export class RewardsStrategy implements Strategy {
                     const marketMaxSpreadCents = maxSpread * 100;
 
                     let tier: 1 | 2 | 3 | null = null;
-                    const isT1 = MarketUtils.isTier1(dailyRewards, competition, minShares, hoursToRes, marketMaxSpreadCents, mid);
-                    const isT2 = MarketUtils.isTier2(dailyRewards, competition, minShares, hoursToRes, marketMaxSpreadCents, mid);
-                    const isT3 = MarketUtils.isTier3(dailyRewards, competition, minShares, hoursToRes, marketMaxSpreadCents);
+
+                    // T1: High Rewards, Tighter Spread req, High Comp OR High Capital Efficiency
+                    // We prioritize Capital Efficiency for small wallets
+                    const isT1 = (dailyRewards >= 200 || capitalEfficiencyScore >= 4.0) && (competition <= 5);
+                    const isT2 = (dailyRewards >= 100 || capitalEfficiencyScore >= 2.0) && (competition <= 8);
+                    const isT3 = (dailyRewards >= 25);
+
+                    // Old MarketUtils calls removed in favor of Capital Efficiency Logic
+                    // const isT1 = MarketUtils.isTier1...
+                    // const isT2 = MarketUtils.isTier2...
+                    // const isT3 = MarketUtils.isTier3...
 
                     let rejectionReason = "";
                     if (!isT1 && !isT2 && !isT3) {
@@ -689,6 +760,15 @@ export class RewardsStrategy implements Strategy {
                         const tickStr = String(market.minimum_tick_size || "0.01");
                         const tickSize = tickStr as TickSize;
 
+                        // Delta Neutral Cost Calc
+                        const yesMidOr = mid || 0.5;
+                        const noMidOr = (1 - mid) || 0.5;
+                        // FIX 2: Correct Min Capital Formula
+                        // Account for price + 2% buffer + 2-sided cost
+                        const minCapitalRequired = minShares * (yesMidOr + noMidOr) * 1.02;
+                        const dnCost = Math.ceil(minShares * yesMidOr + minShares * noMidOr);
+
+
                         candidates.push({
                             marketId: conditionId,
                             gammaMarket: syntheticGamma,
@@ -702,8 +782,8 @@ export class RewardsStrategy implements Strategy {
                             tickSize,
                             negRisk: market.neg_risk || false,
                             // Delta Neutral Cost Calc
-                            // Delta Neutral Cost Calc
-                            dnCost: Math.ceil(minShares * mid + minShares * (1 - mid)),
+                            dnCost,
+
                             yesPrice: mid,
                             noPrice: 1 - mid,
                             yesCost: Math.ceil(minShares * mid),
@@ -711,7 +791,11 @@ export class RewardsStrategy implements Strategy {
                             rewardsMinSize: minShares,
                             rewardsMaxSpread: maxSpread,
                             mode: "QUOTING",
-                            inventory: { yes: 0, no: 0 }
+                            inventory: { yes: 0, no: 0 },
+                            minCapitalRequired,
+                            capitalEfficiencyScore: score > 0 && minCapitalRequired > 0 ? (dailyRewards / minCapitalRequired) * 100 : 0,
+                            dailyRewards,
+                            competition
                         });
                     }
                 } catch (err) {
@@ -779,25 +863,74 @@ export class RewardsStrategy implements Strategy {
 
             // STRICT USER REQUIREMENT: "Only selected Tier 1 markets will be used"
             // Filter first, then Sort.
-            const tier1Candidates = candidates.filter(c => {
-                if (c.tier !== 1) return false;
-                if (this.blacklist.has(c.marketId)) {
-                    // console.log(`[Blacklist] Skipping toxic market: ${c.gammaMarket.question}`);
-                    return false;
-                }
+            const validCandidates = candidates.filter(c => {
+                // We now accept T1 and T2 for diversification if T1 is too expensive/empty
+                if (c.tier > 2) return false;
+                if (this.blacklist.has(c.marketId)) return false;
                 return true;
             });
-            console.log(`Filtered to ${tier1Candidates.length} Tier 1 Candidates (after blacklist).`);
+            console.log(`Filtered to ${validCandidates.length} Valid Candidates (Tier 1 & 2).`);
 
-            // Sort by Yield Score (descending)
-            // Priority: "Highest Payout per Dollar"
-            tier1Candidates.sort((a, b) => {
-                return b.score - a.score;
+            // BONUS: Detect Small Wallet Gems
+            validCandidates.forEach(c => {
+                // minShares 20-50, Rewards >= 100, Competition <= 3
+                const dr = c.dailyRewards || 0;
+                const comp = c.competition || 99;
+                const isGem = c.rewardsMinSize >= 20 && c.rewardsMinSize <= 50 && dr >= 100 && comp <= 3;
+                if (isGem) {
+                    // Force high efficiency score to prioritize
+                    c.capitalEfficiencyScore = (c.capitalEfficiencyScore || 0) * 2.0;
+                    // console.log(`[GEM] Found Small Wallet Gem: ${c.gammaMarket.question.slice(0,30)}`);
+                }
             });
 
-            // Select top N
-            const targetCount = this.customFilter ? 1 : REWARDS_CONFIG.ALLOCATION.MAX_ACTIVE_MARKETS;
-            const topMarkets = tier1Candidates.slice(0, targetCount);
+
+
+            // FIX 1: Hard Cap Active Markets by effectiveMinCap (1.05x buffer)
+            const availableForTrading = Number((await this.clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })).balance) / 1e6; // Refresh balance
+            let globalMaxCapReq = 0;
+
+            validCandidates.forEach(c => {
+                const midPriceSum = (c.yesPrice ?? 0.5) + (c.noPrice ?? 0.5);
+                const effectiveMinCap = c.rewardsMinSize * midPriceSum * 1.05; // 5% buffer
+                c.minCapitalRequired = effectiveMinCap;
+                if (effectiveMinCap > globalMaxCapReq) globalMaxCapReq = effectiveMinCap;
+            });
+
+            // FIX 1: Unified Capital-Consuming Selection Loop
+            // Sort by CES (Small Wallet Gems are already boosted 2x in validCandidates loop)
+            const sortedByCES = [...validCandidates].sort((a, b) => (b.capitalEfficiencyScore || 0) - (a.capitalEfficiencyScore || 0));
+
+            const selectedMarkets: MarketState[] = [];
+            // Use fresh availableForTrading derived above
+            let remainingBalance = availableForTrading;
+
+            const ABSOLUTE_MAX_MARKETS = REWARDS_CONFIG.ALLOCATION.MAX_ACTIVE_MARKETS || 5;
+
+            for (const m of sortedByCES) {
+                // HARD invariant: must afford full two-sided minShares (already calc'd in c.minCapitalRequired with 1.05 boost)
+                const cap = m.minCapitalRequired || Infinity;
+
+                if (remainingBalance >= cap) {
+                    (m as any)._reservedCapital = cap;
+                    selectedMarkets.push(m);
+                    remainingBalance -= cap;
+                } else {
+                    // Stop immediately if we can't afford the next best market.
+                    // Do NOT skip to smaller ones, as that fragments capital on lower quality markets.
+                    break;
+                }
+
+                if (selectedMarkets.length >= ABSOLUTE_MAX_MARKETS) {
+                    break;
+                }
+            }
+
+            console.log(`[Capital Routing] Balance: $${availableUSDC.toFixed(2)} | Selected: ${selectedMarkets.length} | Remaining: $${remainingBalance.toFixed(2)}`);
+            selectedMarkets.forEach(m => console.log(`  -> Picked: ${m.gammaMarket.question.slice(0, 30)}... (CES: ${m.capitalEfficiencyScore?.toFixed(1)}, MinCap: $${m.minCapitalRequired})`));
+
+            const topMarkets = selectedMarkets;
+
 
             // Update active markets with STATE MERGING
             const newActiveMarkets = new Map<string, MarketState>();
@@ -990,17 +1123,30 @@ export class RewardsStrategy implements Strategy {
                 availableUSDC = parseFloat(balRes.balance) / 1e6; // Convert from wei to USDC
 
                 // Phase 3: Fair Budget Allocation
-                const activeCount = this.activeMarkets.size || 1;
-                const totalTargetBudget = availableUSDC * REWARDS_CONFIG.ALLOCATION.MAX_DEPLOYED_PERCENT;
-                let budgetPerMarket = totalTargetBudget / activeCount;
 
-                // Clamp by global max budget per market
-                budgetPerMarket = Math.min(budgetPerMarket, REWARDS_CONFIG.ALLOCATION.MAX_BUDGET_PER_MARKET);
+                // FIX 3: Prioritize Reserved Capital
+                let budgetPerMarket = (state as any)._reservedCapital;
+
+                if (!budgetPerMarket) {
+                    // Fallback for legacy/error cases (though scan should set it)
+                    const activeCount = this.activeMarkets.size || 1;
+                    const totalTargetBudget = availableUSDC * REWARDS_CONFIG.ALLOCATION.MAX_DEPLOYED_PERCENT;
+                    budgetPerMarket = totalTargetBudget / activeCount;
+                    // Clamp by global max budget per market
+                    budgetPerMarket = Math.min(budgetPerMarket, REWARDS_CONFIG.ALLOCATION.MAX_BUDGET_PER_MARKET);
+                }
 
                 console.log(`[Balance] Total: $${availableUSDC.toFixed(2)}, Budget/Mkt: $${budgetPerMarket.toFixed(2)}, Required: ~$${(state.rewardsMinSize * 0.5).toFixed(2)}`);
 
                 if (budgetPerMarket < 5) {
                     this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Budget per market $${budgetPerMarket.toFixed(2)} too low.`);
+                    return;
+                }
+
+                // FIX 2: Hard-Gate Budget against MinCapitalRequired
+                const minCapital = state.minCapitalRequired || (state.rewardsMinSize * ((state.yesCost || 0.5) + (state.noCost || 0.5)));
+                if (budgetPerMarket < minCapital) {
+                    this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Budget $${budgetPerMarket.toFixed(2)} < MinCapital $${minCapital.toFixed(2)}. Cannot meet minShares.`);
                     return;
                 }
 
@@ -1023,12 +1169,106 @@ export class RewardsStrategy implements Strategy {
 
             if (!yesOb || !noOb) return;
 
+            // FIX 4: Use Live Midpoint for Pressure Analysis (Prevent Stale Data)
+            let yesMidLive = 0.5;
+            let noMidLive = 0.5;
+            try {
+                yesMidLive = await this.getMidpointFromAPI(state.yesTokenId);
+                noMidLive = await this.getMidpointFromAPI(state.noTokenId);
+            } catch (e) {
+                // Warning logged inside getMidpoint
+            }
+
             // REWARD OPTIMIZATION: Ladder Strategy vs Single Spread
-            const useLadder = REWARDS_CONFIG.REWARD_OPTIMIZATION.USE_LADDER && this.customSpread === undefined;
+            let useLadder = REWARDS_CONFIG.REWARD_OPTIMIZATION.USE_LADDER && this.customSpread === undefined;
             const useAsymmetric = REWARDS_CONFIG.REWARD_OPTIMIZATION.USE_ASYMMETRIC && this.customSpread === undefined;
 
             let ladderLevels: Array<{ distance: number; sizePercent: number }> = [];
             let targetAvoid = this.customAvoid !== undefined ? this.customAvoid : REWARDS_CONFIG.FILL_AVOIDANCE.MIN_DISTANCE_TO_MID;
+
+            // FIX 4: Correct Ladder Eligibility Check (MinShares * Levels)
+            if (useLadder) {
+                // Determine levels first to know count
+                // Assume standard allocation (70/30) if not defined or dynamic
+                const levelCount = 2; // Default 2 levels for estimate
+                const requiredSharesForLadder = state.rewardsMinSize * levelCount;
+
+                // Check if budget can support MIN SHARES per level
+                // We use _effectiveBudget to check affordability
+                const costPerShare = (state.yesCost || 0.5) + (state.noCost || 0.5);
+                const affordableShares = (state as any)._effectiveBudget / costPerShare;
+
+                if (affordableShares < requiredSharesForLadder) {
+                    useLadder = false;
+                    // this.logAction(state.gammaMarket.question, "LADDER_OFF", -1, -1, -1, `Budget supports ${Math.floor(affordableShares)} shares < Required ${requiredSharesForLadder}. Single Order.`);
+                }
+            }
+
+            // Phase 8: Liquidity Pressure Detection & Hysteresis
+            // Initialize if null
+            if (!state.pressureState) {
+                state.pressureState = {
+                    yesDistance: 0.005,
+                    noDistance: 0.005,
+                    yesExhaustionCycles: 0,
+                    noExhaustionCycles: 0
+                };
+            }
+
+            // Analyze Depth Bands
+            const yesDepth = analyzeDepthBands(yesOb, yesMidLive).bids;
+            const noDepth = analyzeDepthBands(noOb, noMidLive).bids;
+
+            const LP_CONFIG = REWARDS_CONFIG.LIQUIDITY_PRESSURE;
+
+            if (LP_CONFIG.ENABLE_DYNAMIC_DISTANCING) {
+                const MIN_DEPTH = LP_CONFIG.MIN_DEPTH_USDC;
+
+                // Helper for Hysteresis Logic
+                const updatePressureState = (
+                    currentDepth: DepthBands,
+                    currentDist: number,
+                    cycles: number
+                ): { dist: number, cycles: number } => {
+                    let targetDist = LP_CONFIG.DISTANCES.AGGRESSIVE;
+
+                    // Check Aggressive Layer (0.5c)
+                    if (currentDepth.layer1 < MIN_DEPTH) {
+                        // Too thin? Check Moderate (1.0c)
+                        if (currentDepth.layer2 < MIN_DEPTH) {
+                            targetDist = LP_CONFIG.DISTANCES.DEFENSIVE;
+                        } else {
+                            targetDist = LP_CONFIG.DISTANCES.MODERATE;
+                        }
+                    }
+
+                    // Apply Hysteresis: Only change if condition persists
+                    // If target differs from current, increment counter
+                    if (targetDist !== currentDist) {
+                        if (cycles + 1 >= LP_CONFIG.HYSTERESIS_CYCLES) {
+                            return { dist: targetDist, cycles: 0 }; // Change & Reset
+                        }
+                        return { dist: currentDist, cycles: cycles + 1 }; // Wait
+                    }
+
+                    // If target same as current, keep it and reset cycle count (metrics improved or stayed same)
+                    return { dist: currentDist, cycles: 0 };
+                };
+
+                const yesUpdate = updatePressureState(yesDepth, state.pressureState.yesDistance, state.pressureState.yesExhaustionCycles);
+                state.pressureState.yesDistance = yesUpdate.dist;
+                state.pressureState.yesExhaustionCycles = yesUpdate.cycles;
+
+                const noUpdate = updatePressureState(noDepth, state.pressureState.noDistance, state.pressureState.noExhaustionCycles);
+                state.pressureState.noDistance = noUpdate.dist;
+                state.pressureState.noExhaustionCycles = noUpdate.cycles;
+
+                // Log Significant Moves (Retreats)
+                if (yesUpdate.cycles === 0 && yesUpdate.dist > 0.005 && yesUpdate.dist > state.pressureState.yesDistance) {
+                    this.logAction(state.gammaMarket.question, "PRESSURE", -1, -1, yesUpdate.dist, `YES Depth Thin ($${yesDepth.layer1.toFixed(0)} < $${MIN_DEPTH}). Retreating to ${yesUpdate.dist * 100}¢`);
+                }
+            }
+
 
             if (useLadder) {
                 // Use reward-density ladder
@@ -1122,6 +1362,14 @@ export class RewardsStrategy implements Strategy {
             // Two-Sided Requirement: If <0.10 or >0.90, MUST quote both sides
             const needsTwoSided = yesMid < 0.10 || yesMid > 0.90;
 
+            // FIX 2: Enforce Two-Sided BUY Affordability Early
+            const minCostTwoSided = state.rewardsMinSize * ((yesMid ?? 0.5) + (noMid ?? 0.5)) * 1.01;
+            // @ts-ignore
+            if ((state._effectiveBudget || 0) < minCostTwoSided) {
+                // this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Cannot afford two-sided minShares ($${minCostTwoSided.toFixed(2)})`);
+                return;
+            }
+
             // Budget / Sizing
             let rawSize = Math.max(state.rewardsMinSize, 20); // Min 20 shares to be safe
 
@@ -1139,7 +1387,12 @@ export class RewardsStrategy implements Strategy {
             // Phase 3: Budget-Based Capping
             // @ts-ignore
             const mktBudget = state._effectiveBudget || 20;
-            const budgetAdjustedSize = Math.floor(mktBudget); // $1 = 1 share (YES+NO)
+
+            // FIX 3: Correct Budget Capping (Cost per Share)
+            // Use actual mid prices + 1% buffer
+            const costPerShare = (yesMid ?? 0.5) + (noMid ?? 0.5);
+            const budgetAdjustedSize = Math.floor(mktBudget / (costPerShare * 1.01));
+
             if (rawSize > budgetAdjustedSize) {
                 // this.logAction(state.gammaMarket.question, "BUDGET", -1, -1, -1, `Capping size ${rawSize} -> ${budgetAdjustedSize} ($${mktBudget.toFixed(0)})`);
                 rawSize = budgetAdjustedSize;
@@ -1156,6 +1409,12 @@ export class RewardsStrategy implements Strategy {
                 }
             }
 
+            // FIX 1: Hard Floor after ALL scaling
+            if (rawSize < state.rewardsMinSize) {
+                this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Final size ${rawSize} < minShares ${state.rewardsMinSize}`);
+                return;
+            }
+
             // Phase 3: Global Reward Monitor (Log aggregat stats)
             const now = Date.now();
             if (now - this.lastGlobalLogTime > REWARDS_CONFIG.SCALING_AND_ROTATION.GLOBAL_REWARD_LOG_INTERVAL_MS) {
@@ -1168,6 +1427,7 @@ export class RewardsStrategy implements Strategy {
                 console.log(`GLOBAL REWARD MONITOR | Active Markets: ${this.activeMarkets.size} | Total Daily Rewards Est: $${totalDailyRewards.toFixed(2)}`);
                 console.log(`================================================================================\n`);
             }
+
 
             // Fetch Share Balances for Sells (prevent "Insufficient Funds" on Sells)
             let yesShareBal = 0;
@@ -1186,11 +1446,32 @@ export class RewardsStrategy implements Strategy {
             const feeRateYes = await this.gammaClient.getFeeRate(state.yesTokenId) || 0;
             const feeRateNo = await this.gammaClient.getFeeRate(state.noTokenId) || 0;
 
+            // FIX 2 (MANDATORY): Enforce minShares on EACH ladder rung individually
+            // If rawSize splits result in ANY order < minShares, collapse ladder.
+            if (useLadder) {
+                const minLevelPercent = Math.max(...ladderLevels.map(l => l.sizePercent));
+                // Inverse: If rawSize * minPercent < minShares, it fails.
+                // So rawSize must be >= minShares / minPercent
+                const minRequiredRaw = Math.ceil(state.rewardsMinSize / minLevelPercent);
+
+                if (rawSize < minRequiredRaw) {
+                    ladderLevels = [{ distance: ladderLevels[0].distance, sizePercent: 1.0 }];
+                    // console.log(`[Ladder] Collapsed to single order. Raw ${rawSize} < Required ${minRequiredRaw}`);
+                }
+            }
+
             // LADDER-BASED ORDER PLACEMENT
             // Iterate through each ladder level and create orders
+            let batchCostSoFar = 0;
             for (let levelIdx = 0; levelIdx < ladderLevels.length; levelIdx++) {
                 const level = ladderLevels[levelIdx];
-                const levelSize = rawSize * level.sizePercent;
+                // FIX 1: Rigid Size Flooring & MinShares Check
+                const levelSize = Math.floor(rawSize * level.sizePercent);
+
+                if (levelSize < state.rewardsMinSize) {
+                    // console.warn(`[Rewards] Ladder Level ${levelIdx} size ${levelSize} < Min ${state.rewardsMinSize}. Skipping.`);
+                    continue;
+                }
 
                 // Calculate expected score for this level
                 const expectedScore = state.rewardsMaxSpread ? ScoringCalc.calculateScore({
@@ -1225,6 +1506,12 @@ export class RewardsStrategy implements Strategy {
                     if (noStrategy.strategy === 'asymmetric' && noStrategy.distances) {
                         noDistance = noStrategy.distances.bidDistance;
                     }
+
+                    // FIX 5: Clamp Asymmetric Distances
+                    if (state.rewardsMaxSpread) {
+                        yesDistance = Math.min(yesDistance, state.rewardsMaxSpread);
+                        noDistance = Math.min(noDistance, state.rewardsMaxSpread);
+                    }
                 }
 
                 // Calculate Prices for this level
@@ -1247,10 +1534,11 @@ export class RewardsStrategy implements Strategy {
                 const costNo = isValidPrice(noBuyPrice) ? levelSize * noBuyPrice * 1.01 : 0;
                 const levelCost = costYes + costNo;
 
-                if (levelCost > availableUSDC) {
-                    // Not enough funds for this level, skip
-                    continue;
+                // FIX 3: Use Global Tracking Balance (Break if empty)
+                if (batchCostSoFar + levelCost > this.globalTrackingBalance) {
+                    break; // Abort further ladder levels to prevent partial batches
                 }
+                batchCostSoFar += levelCost;
 
                 // YES BUY
                 if (isValidPrice(yesBuyPrice)) {
@@ -1264,7 +1552,6 @@ export class RewardsStrategy implements Strategy {
                         _ladderLevel: levelIdx,
                         _expectedScore: expectedScore
                     });
-                    availableUSDC -= (levelSize * yesBuyPrice * 1.01);
                 }
 
                 // YES SELL -- Only if we have shares
@@ -1282,19 +1569,16 @@ export class RewardsStrategy implements Strategy {
 
                 // NO BUY
                 if (isValidPrice(noBuyPrice)) {
-                    if (availableUSDC >= (levelSize * noBuyPrice * 1.01)) {
-                        ordersToPost.push({
-                            tokenID: state.noTokenId,
-                            price: noBuyPrice,
-                            side: Side.BUY,
-                            size: levelSize,
-                            feeRateBps: feeRateNo,
-                            _cost: levelSize * noBuyPrice * 1.01,
-                            _ladderLevel: levelIdx,
-                            _expectedScore: expectedScore
-                        });
-                        availableUSDC -= (levelSize * noBuyPrice * 1.01);
-                    }
+                    ordersToPost.push({
+                        tokenID: state.noTokenId,
+                        price: noBuyPrice,
+                        side: Side.BUY,
+                        size: levelSize,
+                        feeRateBps: feeRateNo,
+                        _cost: levelSize * noBuyPrice * 1.01,
+                        _ladderLevel: levelIdx,
+                        _expectedScore: expectedScore
+                    });
                 }
 
                 // NO SELL -- Only if we have shares
@@ -1317,10 +1601,39 @@ export class RewardsStrategy implements Strategy {
                 return;
             }
 
+            // FIX 3: Enforce "Two-Sided BUY or Nothing" Guard
+            const buyYes = ordersToPost.find(o => o.tokenID === state.yesTokenId && o.side === Side.BUY);
+            const buyNo = ordersToPost.find(o => o.tokenID === state.noTokenId && o.side === Side.BUY);
+
+            if (!buyYes || !buyNo) {
+                this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, "Missing two-sided BUYs - cannot score");
+                return;
+            }
+
+            // FIX 2: Global Liquidity Check (Prevent partial ladders)
+            let totalBatchCost = 0;
+            ordersToPost.forEach(o => {
+                if (o.side === Side.BUY && o._cost) totalBatchCost += o._cost;
+            });
+
+            if (totalBatchCost > this.globalTrackingBalance) {
+                this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Insufficient Global Liquidity ($${this.globalTrackingBalance.toFixed(2)} < $${totalBatchCost.toFixed(2)})`);
+                return;
+            }
+
+            // Deduct immediately (pessimistic lock)
+            this.globalTrackingBalance -= totalBatchCost;
+
             console.log(`Preparing batch of ${ordersToPost.length} orders for ${state.gammaMarket.question.slice(0, 40)}...`);
 
             for (let i = 0; i < ordersToPost.length; i++) {
                 const params = ordersToPost[i];
+
+                // FIX 5: Final Safety Net Logic
+                if (params.size < state.rewardsMinSize) {
+                    // console.warn(`[Rewards] Skipping order size ${params.size} < Min ${state.rewardsMinSize}`);
+                    continue;
+                }
 
                 // SPREAD VALIDATION (Strict)
                 // SPREAD VALIDATION (Strict via API Mid)
@@ -1428,33 +1741,34 @@ export class RewardsStrategy implements Strategy {
             }
 
             // 4. Verify Scoring Status (User Request)
-            const newOrderIds = signedOrders.map(o => o.orderID).filter(Boolean); // Actually, we need the response IDs, but let's grab from state.orders
+            const newOrderIds = signedOrders.map(o => o.orderID).filter(Boolean);
 
-            // Filter orders placed just now (last 1s)
-            const recentOrders = state.orders.filter(o => Date.now() - o.placedAt < 2000);
+            // FIX 1: Filter to BUY orders only (SELLs don't reliable score)
+            const recentBuyOrders = state.orders.filter(
+                o => Date.now() - o.placedAt < 2000 && o.side === Side.BUY
+            );
 
-            if (recentOrders.length > 0) {
+            if (recentBuyOrders.length > 0) {
                 await new Promise(r => setTimeout(r, 2000)); // Wait for matching engine
 
                 try {
                     // Check scoring status
                     // @ts-ignore
                     const scoreRes = await this.clobClient.areOrdersScoring({
-                        orderIds: recentOrders.map(o => o.orderId)
+                        orderIds: recentBuyOrders.map(o => o.orderId)
                     });
 
-                    // scoreRes is { [orderId]: boolean }
+                    const scoringMap = (scoreRes as any).scoring || scoreRes;
+
                     let scoringCount = 0;
-                    for (const o of recentOrders) {
-                        const isScoring = scoreRes[o.orderId];
-                        if (isScoring) scoringCount++;
-                        // console.log(`[Rewards] Order ${o.orderId.slice(0,8)}... Scoring: ${isScoring ? "YES" : "NO"}`);
+                    for (const o of recentBuyOrders) {
+                        if (scoringMap[o.orderId] === true) scoringCount++;
                     }
 
-                    if (scoringCount === recentOrders.length) {
-                        console.log(`[Rewards] ✅ All ${scoringCount} new orders are SCORING.`);
+                    if (scoringCount === recentBuyOrders.length) {
+                        console.log(`[Rewards] ✅ All ${scoringCount} BUY orders are SCORING.`);
                     } else {
-                        console.warn(`[Rewards] ⚠️ Only ${scoringCount}/${recentOrders.length} orders are SCORING. Check spread/size.`);
+                        console.warn(`[Rewards] ⚠️ Only ${scoringCount}/${recentBuyOrders.length} BUY orders are SCORING.`);
                     }
                 } catch (e) {
                     console.warn("Failed to verify scoring status:", e);
@@ -1670,7 +1984,8 @@ export class RewardsStrategy implements Strategy {
                     try {
                         const balRes = await this.clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
                         const available = parseFloat(balRes.balance) / 1e6;
-                        const recycleSize = Math.max(state.rewardsMinSize, 20);
+                        // FIX 2 (MANDATORY): Enforce strict minShares for Recycling (No exceptions)
+                        const recycleSize = state.rewardsMinSize;
                         const cost = recycleSize * recyclePrice * 1.01;
 
                         if (available > cost) {
@@ -1688,6 +2003,12 @@ export class RewardsStrategy implements Strategy {
                             const posted = await this.clobClient.postOrder(order, OrderType.GTD);
                             if (posted?.orderID) {
                                 state.orders.push({ orderId: posted.orderID, tokenId: recycleTokenId, price: recyclePrice, side: Side.BUY, size: recycleSize, placedAt: Date.now() });
+
+                                // FIX 4: Unblock Quoting during Recycling
+                                // Allow restart if only recycle order exists (prevents getting stuck in MANAGING)
+                                if (state.orders.length === 1 && state.orders[0].side === Side.BUY) {
+                                    state.orders = [];
+                                }
                             }
                         }
                     } catch (e) { console.error("Recycle placement failed:", e); }
