@@ -44,28 +44,91 @@ export const REWARDS_CONFIG = {
 
     // 2️⃣ Capital Allocation
     ALLOCATION: {
-        MAX_DEPLOYED_PERCENT: 0.80, // "Use only half my balance"
-        PER_MARKET_PERCENT: 0.80,   // 5% per market for 20 markets
-        MAX_ACTIVE_MARKETS: 1,     // "Open orders on 20-30 markets"
-        EMERGENCY_RESERVE_PERCENT: 0.20,
+        MAX_DEPLOYED_PERCENT: 0.95,
+        PER_MARKET_PERCENT: 0.20,
+        MAX_ACTIVE_MARKETS: 5,      // Increased for parallel rewards
+        MAX_BUDGET_PER_MARKET: 150, // Limit risk in a single market
+        EMERGENCY_RESERVE_PERCENT: 0.05,
     },
 
     // 3️⃣ Monitoring & Rotation
     MONITORING: {
-        RECALC_INTERVAL_MS: 30 * 60 * 1000, // 30 mins
-        VOLATILITY_WINDOW_SECONDS: 60, // Short window
+        RECALC_INTERVAL_MS: 30 * 60 * 1000,
+        VOLATILITY_WINDOW_SECONDS: 60,
         MAX_VOLATILITY_CHANGE: 0.05,
         LAST_24H_FREEZE: true,
         MAX_INVENTORY_PERCENT: 0.20,
     },
 
-    // Fill Avoidance (Restored)
+    // Fill Avoidance
     FILL_AVOIDANCE: {
         MIN_DISTANCE_TO_MID: 0.005, // 0.5 cents
         CHECK_INTERVAL_MS: 3000
     },
 
-    // 4️⃣ Global Safety
+    // 4️⃣ Scaling & Rotation (Phase 3)
+    SCALING_AND_ROTATION: {
+        BLACKLIST_COOLDOWN_MS: 12 * 60 * 60 * 1000, // 12h
+        TOXIC_FILL_THRESHOLD: 3,           // 3 fills in window = toxic
+        TOXIC_WINDOW_MS: 1 * 60 * 60 * 1000,
+        MIN_YIELD_SCORE_TO_ROTATE: 10,     // Don't rotate if yield is too good
+        GLOBAL_REWARD_LOG_INTERVAL_MS: 60 * 60 * 1000, // 1h
+    },
+
+    // 5️⃣ Reward Optimization (Quadratic Scoring)
+    REWARD_OPTIMIZATION: {
+        USE_LADDER: true,
+        LADDER_LEVELS: [
+            { distance: 0.005, sizePercent: 0.70 },
+            { distance: 0.010, sizePercent: 0.30 }
+        ],
+        USE_ASYMMETRIC: true,
+        ASYMMETRIC_SENSITIVITY: 0.5,
+        TIGHTER_SPREAD_MULTIPLIER: 0.3,
+    },
+
+    // 6️⃣ Inventory & Capital Efficiency (Phase 2)
+    CAPITAL_EFFICIENCY: {
+        ENABLE_RECYCLING: true,
+        RECYCLE_MAX_TICK_AGE_MS: 10000,
+        ENABLE_MERGE: true,
+        CONCENTRATION_THRESHOLD: 80,
+        MAX_CAPITAL_CONCENTRATION: 2.5, // Increased from 0.90 to 2.5 as per previous walkthrough
+    },
+
+    // 7️⃣ Risk & Latency Management (Phase 4)
+    RISK_MANAGEMENT: {
+        VOLATILITY_WINDOW_MS: 60 * 1000,   // 60 second rolling window
+        VOLATILITY_MIN_DATA_POINTS: 10,  // Need some history to calculate
+        // Freeze if Volatility > (MaxSpread * VOLATILITY_SENSITIVITY)
+        VOLATILITY_SENSITIVITY: 0.33,
+
+        PREDICTIVE_CANCEL_TPS: 5,         // Cancel if > 5 trades/sec
+        PREDICTIVE_CANCEL_WINDOW_MS: 3000, // Look back 3s
+
+        ADAPTIVE_SIZING_BASELINE_REWARDS: 50, // Markets with $50 rewards get baseline size
+    },
+
+    // 9️⃣ Temporal & Advanced (Phase 5)
+    TEMPORAL: {
+        GTD_EXPIRY_SECONDS: 300,           // 5 minute hard expiry
+        ENABLE_TEMPORAL_ALPHA: true,
+        // Hours (0-23) ET? We'll assume local system time for now.
+        // Low activity periods where we are more opportunistic
+        LOW_ACTIVITY_HOURS: [1, 2, 3, 4, 5, 6, 7, 8],
+        RISK_PROFILE: {
+            LOW_ACTIVITY_MULTIPLIER: 1.5,  // Take more risk
+            HIGH_ACTIVITY_MULTIPLIER: 0.8, // Pull back during peak vol
+        }
+    },
+
+    // 🔟 Performance & Dashboard (Phase 6)
+    MONITORING_ADVANCED: {
+        DASHBOARD_INTERVAL_MS: 5 * 60 * 1000, // Show table every 5 mins
+        SCORING_CHECK_INTERVAL_MS: 30 * 1000, // Verify scoring every 30s
+    },
+
+    // 1️⃣1️⃣ Global Safety
     SAFETY: {
         MIN_TOTAL_DAILY_REWARDS: 10.0,
     }

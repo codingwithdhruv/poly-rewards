@@ -1,4 +1,4 @@
-import { ClobClient, OrderType, Side, TickSize, MarketReward, AssetType } from "@polymarket/clob-client";
+import { ClobClient, OrderType, Side, TickSize, MarketReward, AssetType, ApiKeyCreds } from "@polymarket/clob-client";
 import { RelayClient } from "@polymarket/builder-relayer-client";
 import { Strategy } from "./types.js";
 import { GammaClient, GammaMarket } from "../clients/gamma-api.js";
@@ -6,6 +6,10 @@ import { REWARDS_CONFIG } from "../config/rewardsConfig.js";
 import { CONFIG } from "../clients/config.js";
 import * as MarketUtils from "../lib/marketUtils.js";
 import { ethers } from "ethers";
+import WebSocket from "ws";
+import * as ScoringCalc from "../lib/scoringCalculator.js";
+import * as OrderbookAnalyzer from "../lib/orderbookAnalyzer.js";
+import { mergePositions } from "../lib/ctfHelper.js";
 
 interface TrackedOrder {
     orderId: string;
@@ -14,7 +18,11 @@ interface TrackedOrder {
     side: Side;
     size: number;
     placedAt: number;
+    ladderLevel?: number;      // Which ladder level (0, 1, etc.)
+    expectedScore?: number;    // Calculated reward score
 }
+
+type BotMode = "QUOTING" | "MANAGING" | "FROZEN";
 
 interface MarketState {
     marketId: string;
@@ -37,6 +45,14 @@ interface MarketState {
     yesCost?: number;
     noCost?: number;
     dynamicStoploss?: number; // Store the calculated SL for this batch
+
+    // Inventory & Mode Tracking
+    mode: BotMode;
+    inventory: {
+        yes: number;
+        no: number;
+    };
+    lastFillTime?: number;
 }
 
 
@@ -52,17 +68,40 @@ export class RewardsStrategy implements Strategy {
     private lastRotationTime = 0;
     private lowBalancePauseUntil: number = 0; // Timestamp to resume placing orders
     private scanInterval: NodeJS.Timeout | null = null;
-    private globalNonce = Date.now(); // FIX: Global nonce tracker to guarantee uniqueness
+    // Phase 3: Market Selection & Scaling & Blacklisting
+    private blacklist: Map<string, number> = new Map(); // marketId -> cooldownUntil
+    private fillTrackers: Map<string, number[]> = new Map(); // marketId -> [fillTimestamps]
+    private lastGlobalLogTime = 0;
+
+    // Phase 4: Risk & Latency
+    private priceHistory: Map<string, { timestamp: number, mid: number }[]> = new Map();
+    private tradeHistory: Map<string, number[]> = new Map(); // public trade timestamps
+
+    // Phase 5 & 6: Temporal & Performance
+    private lastDashboardLogTime = 0;
+    private lastScoringCheckTime = 0;
+    private marketStats: Map<string, {
+        fills: number,
+        lastFills: number,
+        startTime: number,
+        cumulativeRewards: number,
+        isScoring: boolean
+    }> = new Map();
+
+    // WS Client
+    private ws: WebSocket | null = null;
+    private creds?: ApiKeyCreds;
 
     // Custom Filter for single market mode
     private customFilter?: string;
     private customSpread?: number;
     private customAvoid?: number;
 
-    constructor(customFilter?: string, customSpread?: number, customAvoid?: number) {
+    constructor(customFilter?: string, customSpread?: number, customAvoid?: number, creds?: ApiKeyCreds) {
         this.customFilter = customFilter;
         this.customSpread = customSpread;
         this.customAvoid = customAvoid;
+        this.creds = creds;
         if (customFilter) {
             console.log(`[Custom Mode] Filter: "${customFilter}", Spread: ${customSpread || 0.01} ($), Avoid: ${customAvoid || 0.005} ($)`);
         }
@@ -104,16 +143,187 @@ export class RewardsStrategy implements Strategy {
         this.relayClient = relayClient;
         this.gammaClient = new GammaClient();
         console.log("Rewards Strategy Initialized"); // v2.0 Production
+
+        if (this.creds) {
+            this.initUserStream();
+        } else {
+            console.warn("[WS] No API Credentials provided. Fill detection disabled!");
+        }
+    }
+
+    private initUserStream() {
+        if (!this.creds) return;
+
+        console.log("[WS] Connecting to User Channel (via /ws/user)...");
+        this.ws = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/user");
+
+        this.ws.on("open", () => {
+            console.log("[WS] Connected. Authenticating...");
+            const authMsg = {
+                type: "user",
+                auth: {
+                    apiKey: this.creds!.key,
+                    secret: this.creds!.secret,
+                    passphrase: this.creds!.passphrase
+                }
+            };
+            this.ws?.send(JSON.stringify(authMsg));
+            // Keep alive: Server sends PING, we reply PONG (handled in on('message'))
+            // We do NOT need to send active pings, which causes INVALID OPERATION.
+        });
+
+        this.ws.on("message", (data: any) => {
+            try {
+                const strData = data.toString();
+
+                if (strData === "PING" || strData === "ping") {
+                    this.ws?.send("PONG");
+                    return;
+                }
+
+                if (strData === "INVALID OPERATION") {
+                    console.error("[WS] Server returned INVALID OPERATION. Check auth payload.");
+                    return;
+                }
+                const msg = JSON.parse(strData);
+                if (msg.event_type === "trade" && (msg.status === "MATCHED" || msg.status === "MINED")) {
+                    this.handleFill(msg);
+                }
+                if (msg.event_type === "error") {
+                    console.error("[WS] Error:", msg.message);
+                }
+            } catch (e) {
+                console.error("[WS] Parse error:", e, "Raw:", data.toString());
+            }
+        });
+
+        this.ws.on("error", (err) => console.error("[WS] Connection Error:", err));
+        this.ws.on("close", () => {
+            console.warn("[WS] Closed. Reconnecting in 5s...");
+            setTimeout(() => this.initUserStream(), 5000);
+        });
+    }
+
+    private handleFill(msg: any) {
+        // msg: { asset_id, side: "BUY"|"SELL", size, price, ... }
+        // NOTE: side is FROM THE MAKER'S PERSPECTIVE? Or Taker?
+        // Usually User Channel 'side' is YOUR side. A BUY means YOU BOUGHT.
+
+        // Find market by asset_id (token_id)
+        let foundState: MarketState | undefined;
+        let isYes = false;
+
+        for (const state of this.activeMarkets.values()) {
+            if (state.yesTokenId === msg.asset_id) {
+                foundState = state;
+                isYes = true;
+                break;
+            }
+            if (state.noTokenId === msg.asset_id) {
+                foundState = state;
+                isYes = false;
+                break;
+            }
+        }
+
+        if (foundState) {
+            console.log(`[FILL DETECTED] ${foundState.gammaMarket.question.slice(0, 20)} | ${msg.side} ${msg.size} @ ${msg.price}`);
+
+            // Phase 3: Toxic Fill Tracking
+            const now = Date.now();
+            const fills = this.fillTrackers.get(foundState.marketId) || [];
+            const windowStart = now - REWARDS_CONFIG.SCALING_AND_ROTATION.TOXIC_WINDOW_MS;
+            const recentFills = fills.filter(t => t > windowStart);
+            recentFills.push(now);
+            this.fillTrackers.set(foundState.marketId, recentFills);
+
+            if (recentFills.length >= REWARDS_CONFIG.SCALING_AND_ROTATION.TOXIC_FILL_THRESHOLD) {
+                const cooldown = REWARDS_CONFIG.SCALING_AND_ROTATION.BLACKLIST_COOLDOWN_MS;
+                console.warn(`[TOXICITY] Market ${foundState.marketId} filled ${recentFills.length}x in window. Blacklisting for ${cooldown / 3600000}h.`);
+                this.blacklist.set(foundState.marketId, now + cooldown);
+                // Force rotation in next loop by letting it be 'managing' then cleared
+            }
+
+            // Phase 5 & 6: Stat Tracking
+            const stats = this.marketStats.get(foundState.marketId) || { fills: 0, lastFills: 0, startTime: Date.now(), cumulativeRewards: 0, isScoring: true };
+            stats.fills += 1;
+            this.marketStats.set(foundState.marketId, stats);
+
+            // Switch to Managing Mode immediately
+            foundState.mode = "MANAGING";
+            foundState.lastFillTime = Date.now();
+            // Update estimated inventory (API sync verifies later)
+            const size = parseFloat(msg.size);
+            if (msg.side === "BUY") {
+                if (isYes) foundState.inventory.yes += size;
+                else foundState.inventory.no += size;
+            } else {
+                if (isYes) foundState.inventory.yes -= size;
+                else foundState.inventory.no -= size;
+            }
+        }
+    }
+
+    private updatePriceHistory(marketId: string, mid: number) {
+        const now = Date.now();
+        const history = this.priceHistory.get(marketId) || [];
+        history.push({ timestamp: now, mid });
+
+        // Prune old data
+        const oneMinuteAgo = now - REWARDS_CONFIG.RISK_MANAGEMENT.VOLATILITY_WINDOW_MS;
+        const pruned = history.filter(h => h.timestamp > oneMinuteAgo);
+        this.priceHistory.set(marketId, pruned);
+    }
+
+    private calculateVolatility(marketId: string): number {
+        const history = this.priceHistory.get(marketId) || [];
+        if (history.length < REWARDS_CONFIG.RISK_MANAGEMENT.VOLATILITY_MIN_DATA_POINTS) return 0;
+
+        const mids = history.map(h => h.mid);
+        const mean = mids.reduce((a, b) => a + b, 0) / mids.length;
+        const squareDiffs = mids.map(m => Math.pow(m - mean, 2));
+        const avgSquareDiff = squareDiffs.reduce((a, b) => a + b, 0) / squareDiffs.length;
+        return Math.sqrt(avgSquareDiff);
+    }
+
+    private getCurrentRiskMultiplier(): number {
+        if (!REWARDS_CONFIG.TEMPORAL.ENABLE_TEMPORAL_ALPHA) return 1.0;
+
+        const hour = new Date().getHours();
+        const isLowActivity = REWARDS_CONFIG.TEMPORAL.LOW_ACTIVITY_HOURS.includes(hour);
+
+        return isLowActivity
+            ? REWARDS_CONFIG.TEMPORAL.RISK_PROFILE.LOW_ACTIVITY_MULTIPLIER
+            : REWARDS_CONFIG.TEMPORAL.RISK_PROFILE.HIGH_ACTIVITY_MULTIPLIER;
+    }
+
+    private printPerformanceDashboard() {
+        console.log(`\n================================================================================`);
+        console.log(`PRODUCTION PERFORMANCE DASHBOARD | ${new Date().toLocaleTimeString()} `);
+        console.log(`--------------------------------------------------------------------------------`);
+        console.log(`Market                         | Fills | Start Time | Rewards Est | Scoring?`);
+        console.log(`-------------------------------|-------|------------|-------------|---------`);
+
+        for (const [id, state] of this.activeMarkets.entries()) {
+            const stats = this.marketStats.get(id) || { fills: 0, lastFills: 0, startTime: Date.now(), cumulativeRewards: 0, isScoring: true };
+            const mktName = state.gammaMarket.question.slice(0, 30).padEnd(30, " ");
+            const startTimeStr = new Date(stats.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const rewards = state.gammaMarket.clobRewards?.[0]?.rewardsDailyRate || 0;
+            const scoringStr = stats.isScoring ? "YES" : "NO!!";
+
+            console.log(`${mktName} | ${stats.fills.toString().padEnd(5)} | ${startTimeStr.padEnd(10)} | $${rewards.toFixed(2).padEnd(10)} | ${scoringStr}`);
+        }
+        console.log(`================================================================================\n`);
     }
 
     private printLogHeader() {
-        console.log(`\nTime      | Market               | Action   | Spread   | Target   | StopLoss | Details`);
-        console.log(`----------|----------------------|----------|----------|----------|----------|----------------------------------------`);
+        console.log(`Time      | Market                         | Action       | Spread   | Target   | StopLoss | Details`);
+        console.log(`----------|--------------------------------|--------------|----------|----------|----------|----------------------------------------`);
     }
 
     private logAction(market: string, action: string, spread: number, target: number, stoploss: number, details: string) {
         const time = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const mktName = market.length > 20 ? market.substring(0, 17) + "..." : market.padEnd(20, " ");
+        const mktName = market.length > 30 ? market.substring(0, 27) + "..." : market.padEnd(30, " ");
 
         // Colors
         const RESET = "\x1b[0m";
@@ -128,7 +338,7 @@ export class RewardsStrategy implements Strategy {
         if (action === "CONFIG" || action === "LOW FUNDS") color = YELLOW;
         if (action === "PAUSED") color = CYAN;
 
-        const actionStr = action.padEnd(8, " ");
+        const actionStr = action.padEnd(12, " ");
         const spreadStr = spread > 0 ? spread.toFixed(4) : "-";
         const targetStr = target > 0 ? target.toFixed(4) : "-";
         const slStr = stoploss > 0 ? stoploss.toFixed(4) : "-";
@@ -163,20 +373,54 @@ export class RewardsStrategy implements Strategy {
                     await this.scanAndRotate();
                 }
 
+                // 2.1 Dashboard & Scoring Monitor (Phase 6)
+                if (now - this.lastDashboardLogTime > REWARDS_CONFIG.MONITORING_ADVANCED.DASHBOARD_INTERVAL_MS) {
+                    this.lastDashboardLogTime = now;
+                    this.printPerformanceDashboard();
+                }
+
+                // 2.2 Scoring Verification (Phase 5)
+                if (now - this.lastScoringCheckTime > REWARDS_CONFIG.MONITORING_ADVANCED.SCORING_CHECK_INTERVAL_MS) {
+                    this.lastScoringCheckTime = now;
+                    for (const [mid, state] of this.activeMarkets.entries()) {
+                        try {
+                            if (state.orders.length === 0) continue;
+                            const scoringRes = await this.clobClient.areOrdersScoring({ orderIds: state.orders.map(o => o.orderId) });
+                            const isScoring = scoringRes.scoring; // Assuming the response has a scoring boolean
+                            const stats = this.marketStats.get(mid) || { fills: 0, lastFills: 0, startTime: now, cumulativeRewards: 0, isScoring: true };
+                            stats.isScoring = isScoring;
+                            this.marketStats.set(mid, stats);
+                            if (!isScoring) {
+                                this.logAction(state.gammaMarket.question, "PENALTY", -1, -1, -1, "Orders not scoring rewards!");
+                            }
+                        } catch (e) { /* ignore */ }
+                    }
+                }
+
                 // 3. Order Management (Placement/Update)
                 for (const [marketId, state] of this.activeMarkets.entries()) {
-                    if (!state.isFrozen) {
-                        // 3. Risk Management (Fill Avoidance) - ALWAYS RUN
-                        await this.runFillAvoidance(state);
-
-                        // 4. Order Management (Requote/Place) - SKIP IF PAUSED (Low Funds)
-                        if (Date.now() < this.lowBalancePauseUntil) {
-                            this.logAction(state.gammaMarket.question, "PAUSED", -1, -1, -1, `Paused for funds. Resumes in ${((this.lowBalancePauseUntil - Date.now()) / 1000).toFixed(0)}s.`);
-                            continue;
-                        }
-
-                        await this.manageMarketOrders(state);
+                    if (state.isFrozen) {
+                        // TODO: Check for unfreeze condition (e.g. time passed)
+                        continue;
                     }
+
+                    // MANAGING MODE (Priority)
+                    if (state.mode === "MANAGING") {
+                        await this.runPositionManagement(state);
+                        continue;
+                    }
+
+                    // QUOTING MODE
+                    // 3. Risk Management (Fill Avoidance) - ALWAYS RUN
+                    await this.runFillAvoidance(state);
+
+                    // 4. Order Management (Requote/Place) - SKIP IF PAUSED (Low Funds)
+                    if (Date.now() < this.lowBalancePauseUntil) {
+                        this.logAction(state.gammaMarket.question, "PAUSED", -1, -1, -1, `Paused for funds. Resumes in ${((this.lowBalancePauseUntil - Date.now()) / 1000).toFixed(0)}s.`);
+                        continue;
+                    }
+
+                    await this.manageMarketOrders(state);
                 }
 
                 await new Promise(r => setTimeout(r, 2000)); // 2s loop
@@ -465,7 +709,9 @@ export class RewardsStrategy implements Strategy {
                             yesCost: Math.ceil(minShares * mid),
                             noCost: Math.ceil(minShares * (1 - mid)),
                             rewardsMinSize: minShares,
-                            rewardsMaxSpread: maxSpread
+                            rewardsMaxSpread: maxSpread,
+                            mode: "QUOTING",
+                            inventory: { yes: 0, no: 0 }
                         });
                     }
                 } catch (err) {
@@ -525,10 +771,23 @@ export class RewardsStrategy implements Strategy {
             }
             console.log("-".repeat(100));
 
+            // Clear expired blacklist entries
+            const now = Date.now();
+            for (const [id, expiry] of this.blacklist.entries()) {
+                if (now > expiry) this.blacklist.delete(id);
+            }
+
             // STRICT USER REQUIREMENT: "Only selected Tier 1 markets will be used"
             // Filter first, then Sort.
-            const tier1Candidates = candidates.filter(c => c.tier === 1);
-            console.log(`Filtered to ${tier1Candidates.length} Tier 1 Candidates.`);
+            const tier1Candidates = candidates.filter(c => {
+                if (c.tier !== 1) return false;
+                if (this.blacklist.has(c.marketId)) {
+                    // console.log(`[Blacklist] Skipping toxic market: ${c.gammaMarket.question}`);
+                    return false;
+                }
+                return true;
+            });
+            console.log(`Filtered to ${tier1Candidates.length} Tier 1 Candidates (after blacklist).`);
 
             // Sort by Yield Score (descending)
             // Priority: "Highest Payout per Dollar"
@@ -546,8 +805,11 @@ export class RewardsStrategy implements Strategy {
             for (const m of topMarkets) {
                 if (this.activeMarkets.has(m.marketId)) {
                     const oldState = this.activeMarkets.get(m.marketId)!;
-                    // Preserve order state
+                    // Preserve order state & managing mode
                     m.orders = oldState.orders;
+                    m.mode = oldState.mode;
+                    m.inventory = oldState.inventory;
+                    m.lastFillTime = oldState.lastFillTime;
                     newActiveMarkets.set(m.marketId, m);
                 } else {
                     console.log(`Adding new market: ${m.gammaMarket.question} (Tier ${m.tier}, Rewards ${MarketUtils.extractDailyRewards(m.gammaMarket).toFixed(2)})`);
@@ -611,6 +873,20 @@ export class RewardsStrategy implements Strategy {
 
                 if (yesMidVal === null || noMidVal === null) continue;
 
+                let triggered = false;
+
+                // Phase 4: Volatility Tracking & Freezing
+                this.updatePriceHistory(id, yesMidVal);
+                const volatility = this.calculateVolatility(id);
+                const maxSpread = state.rewardsMaxSpread || 0.1;
+                const freezeThreshold = maxSpread * REWARDS_CONFIG.RISK_MANAGEMENT.VOLATILITY_SENSITIVITY;
+
+                if (volatility > freezeThreshold) {
+                    this.logAction(state.gammaMarket.question, "FREEZE", -1, -1, -1, `High Volatility: ${volatility.toFixed(4)} > ${freezeThreshold.toFixed(4)}. Freezing market.`);
+                    state.isFrozen = true;
+                    triggered = true;
+                }
+
                 // 2. Fetch Official Spread (API) - SPREAD COMPRESSION CHECK
                 let currentSpread = 0.01;
                 try {
@@ -620,11 +896,24 @@ export class RewardsStrategy implements Strategy {
                     // console.warn("Failed to get spread for avoidance", e);
                 }
 
-                const distThreshold = state.dynamicStoploss !== undefined
+                const distThresholdBase = state.dynamicStoploss !== undefined
                     ? state.dynamicStoploss
                     : (this.customAvoid !== undefined ? this.customAvoid : REWARDS_CONFIG.FILL_AVOIDANCE.MIN_DISTANCE_TO_MID);
 
-                let triggered = false;
+                // Phase 4: Adaptive Distance (Predictive Cancel)
+                // If volatility is significant, expand cancellation distance to be safer
+                let distThreshold = distThresholdBase;
+                if (volatility > (freezeThreshold * 0.5)) { // Start expanding at 50% of freeze
+                    const volMultiplier = 1 + (volatility / freezeThreshold); // Up to 2x distance
+                    distThreshold = distThresholdBase * volMultiplier;
+                    // this.logAction(state.gammaMarket.question, "ADAPT", -1, -1, distThreshold, `Expanded threshold due to vol: ${volatility.toFixed(4)}`);
+                }
+
+                // Phase 5: Temporal Alpha (Tighter stoploss during low activity)
+                const temporalMult = this.getCurrentRiskMultiplier();
+                if (temporalMult !== 1.0) {
+                    distThreshold = distThreshold / temporalMult;
+                }
 
                 // CHECK 1: GLOBAL SPREAD TOO TIGHT?
                 // User Rule: "cancel all limits if gap gets less than 0.2c either side" (Implies tight compressed market)
@@ -700,15 +989,24 @@ export class RewardsStrategy implements Strategy {
 
                 availableUSDC = parseFloat(balRes.balance) / 1e6; // Convert from wei to USDC
 
-                // The original console.log had a syntax error, fixing it here.
-                // It also referenced 'balance', 'locked', 'allowance' which are no longer calculated this way.
-                // Adjusting to reflect the new simplified availableUSDC.
-                console.log(`[Balance] Available: $${availableUSDC.toFixed(2)}, Required: ~$${(state.rewardsMinSize * 0.5).toFixed(2)}`);
+                // Phase 3: Fair Budget Allocation
+                const activeCount = this.activeMarkets.size || 1;
+                const totalTargetBudget = availableUSDC * REWARDS_CONFIG.ALLOCATION.MAX_DEPLOYED_PERCENT;
+                let budgetPerMarket = totalTargetBudget / activeCount;
 
-                if (availableUSDC < 1) { // Min threshold to even bother
-                    // console.warn(`[Skip] Insufficient Effective USDC: ${availableUSDC.toFixed(2)} (Bal: ${balance.toFixed(2)}, Allow: ${allowance.toFixed(2)})`);
+                // Clamp by global max budget per market
+                budgetPerMarket = Math.min(budgetPerMarket, REWARDS_CONFIG.ALLOCATION.MAX_BUDGET_PER_MARKET);
+
+                console.log(`[Balance] Total: $${availableUSDC.toFixed(2)}, Budget/Mkt: $${budgetPerMarket.toFixed(2)}, Required: ~$${(state.rewardsMinSize * 0.5).toFixed(2)}`);
+
+                if (budgetPerMarket < 5) {
+                    this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, `Budget per market $${budgetPerMarket.toFixed(2)} too low.`);
                     return;
                 }
+
+                // Store the effective budget for sizing later
+                // @ts-ignore
+                state._effectiveBudget = budgetPerMarket;
             } catch (e) {
                 console.warn("Failed to fetch balance, assuming 0 to be safe:", e);
                 return;
@@ -725,62 +1023,82 @@ export class RewardsStrategy implements Strategy {
 
             if (!yesOb || !noOb) return;
 
-            // DYNAMIC SPREAD LOGIC (Applied to ALL Markets)
-            let targetOffset = this.customSpread !== undefined ? this.customSpread : 0.01;
+            // REWARD OPTIMIZATION: Ladder Strategy vs Single Spread
+            const useLadder = REWARDS_CONFIG.REWARD_OPTIMIZATION.USE_LADDER && this.customSpread === undefined;
+            const useAsymmetric = REWARDS_CONFIG.REWARD_OPTIMIZATION.USE_ASYMMETRIC && this.customSpread === undefined;
+
+            let ladderLevels: Array<{ distance: number; sizePercent: number }> = [];
             let targetAvoid = this.customAvoid !== undefined ? this.customAvoid : REWARDS_CONFIG.FILL_AVOIDANCE.MIN_DISTANCE_TO_MID;
 
-            // User Rule: "run generally also and be dynamic and used for risk management 24/7"
-            // We use dynamic (OrderBook based) logic unless manual overrides are set.
-            // Even if manual overrides are NOT set, we want to respect the "Dynamic" behavior:
-            // Target = CurrentSpread * 2
-            // Clamp = RewardsMaxSpread / 2 (if available)
+            if (useLadder) {
+                // Use reward-density ladder
+                ladderLevels = REWARDS_CONFIG.REWARD_OPTIMIZATION.LADDER_LEVELS;
 
-            if (this.customSpread === undefined) {
-                // Try to get OFFICIAL spread from API first (Most reliable)
-                let currentSpread = 0.01;
-                try {
-                    const spreadRes = await this.clobClient.getSpread(state.yesTokenId);
-                    currentSpread = Number(spreadRes.spread);
-                    // If API returns 0 or invalid, fall back to calculated
-                    if (currentSpread <= 0.000001) {
+                // Calculate expected scores for logging
+                if (state.rewardsMaxSpread) {
+                    const scores = ScoringCalc.compareLadderLevels(
+                        ladderLevels.map(l => ({ distance: l.distance, size: state.rewardsMinSize * l.sizePercent })),
+                        state.rewardsMaxSpread
+                    );
+                    const totalScore = scores.reduce((sum, s) => sum + s.score, 0);
+                    const avgEfficiency = scores.reduce((sum, s) => sum + s.efficiency, 0) / scores.length;
+
+                    this.logAction(state.gammaMarket.question, "LADDER", -1, -1, -1,
+                        `Levels: ${ladderLevels.length}, Score: ${totalScore.toFixed(1)}, Eff: ${(avgEfficiency * 100).toFixed(0)}%`);
+                }
+
+                // Set dynamic stoploss to tightest ladder level
+                targetAvoid = Math.min(...ladderLevels.map(l => l.distance)) * 0.5;
+                state.dynamicStoploss = targetAvoid;
+
+            } else {
+                // Legacy single-spread logic
+                let targetOffset = this.customSpread !== undefined ? this.customSpread : 0.01;
+
+                if (this.customSpread === undefined) {
+                    // Get current spread
+                    let currentSpread = 0.01;
+                    try {
+                        const spreadRes = await this.clobClient.getSpread(state.yesTokenId);
+                        currentSpread = Number(spreadRes.spread);
+                        if (currentSpread <= 0.000001) {
+                            const bestAsk = Number(yesOb.asks[0]?.price || 1);
+                            const bestBid = Number(yesOb.bids[0]?.price || 0);
+                            currentSpread = bestAsk - bestBid;
+                        }
+                    } catch (e) {
                         const bestAsk = Number(yesOb.asks[0]?.price || 1);
                         const bestBid = Number(yesOb.bids[0]?.price || 0);
                         currentSpread = bestAsk - bestBid;
                     }
-                } catch (e) {
-                    // Fallback to manual calc
-                    const bestAsk = Number(yesOb.asks[0]?.price || 1);
-                    const bestBid = Number(yesOb.bids[0]?.price || 0);
-                    currentSpread = bestAsk - bestBid;
+
+                    if (currentSpread < 0) currentSpread = 0.01;
+                    if (currentSpread > 0.99) currentSpread = 0.05;
+
+                    targetOffset = currentSpread * 2;
+
+                    if (state.rewardsMaxSpread !== undefined) {
+                        const maxAllowable = state.rewardsMaxSpread / 2;
+                        if (targetOffset > maxAllowable) targetOffset = maxAllowable;
+                    }
+                    const minTick = Number(state.tickSize) || 0.01;
+                    if (targetOffset < minTick) targetOffset = minTick;
+
+                    this.logAction(state.gammaMarket.question, "REQUOTE", currentSpread, targetOffset, -1,
+                        `Max: ${state.rewardsMaxSpread ? state.rewardsMaxSpread.toFixed(3) : "None"}`);
                 }
 
-                // Sanity check: If spread is still effectively empty (~1.0), default to a tight spread to probe? 
-                // Or better, default to MaxSpread/4 to be safe but competitive?
-                // But let's trust the data for now, just sanitize < 0
-                if (currentSpread < 0) currentSpread = 0.01;
-                if (currentSpread > 0.99) currentSpread = 0.05; // Cap "empty" book spread to 5c to avoid wide quotes
+                // Convert single offset to ladder format for unified processing
+                ladderLevels = [{ distance: targetOffset, sizePercent: 1.0 }];
 
-                targetOffset = currentSpread * 2;
-
-                // Constraint: Don't exceed Max Rewards Spread / 2 (stay inside rewards) if defined
-                if (state.rewardsMaxSpread !== undefined) {
-                    const maxAllowable = state.rewardsMaxSpread / 2;
-                    if (targetOffset > maxAllowable) targetOffset = maxAllowable;
+                if (this.customAvoid === undefined) {
+                    targetAvoid = targetOffset * 0.5;
+                    state.dynamicStoploss = targetAvoid;
+                    this.logAction(state.gammaMarket.question, "CONFIG", -1, -1, targetAvoid,
+                        `Dynamic Stoploss: ${targetAvoid.toFixed(4)}`);
+                } else {
+                    state.dynamicStoploss = undefined;
                 }
-                // Constraint: Minimum 1 tick
-                const minTick = Number(state.tickSize) || 0.01;
-                if (targetOffset < minTick) targetOffset = minTick;
-
-                this.logAction(state.gammaMarket.question, "REQUOTE", currentSpread, targetOffset, -1, `Max: ${state.rewardsMaxSpread ? state.rewardsMaxSpread.toFixed(3) : "None"}`);
-            }
-
-            if (this.customAvoid === undefined) {
-                targetAvoid = targetOffset * 0.5;
-                state.dynamicStoploss = targetAvoid;
-                this.logAction(state.gammaMarket.question, "CONFIG", -1, -1, targetAvoid, `Dynamic Stoploss: ${targetAvoid.toFixed(4)} (Cancel if Spread < ${targetAvoid.toFixed(4)})`);
-            } else {
-                state.dynamicStoploss = undefined;
-                this.logAction(state.gammaMarket.question, "CONFIG", -1, -1, this.customAvoid, `Using Manual Stoploss`);
             }
 
 
@@ -795,63 +1113,144 @@ export class RewardsStrategy implements Strategy {
                 return;
             }
 
+
             const tickNum = Number(state.tickSize);
-
-            // Calculate Prices: Mid +/- Target
-            // YES
-            const yesBuyPrice = this.roundToTick(yesMid - targetOffset, tickNum);
-            const yesSellPrice = this.roundToTick(yesMid + targetOffset, tickNum);
-
-            // NO
-            const effectiveNoMid = noMid ?? (1 - yesMid);
-            const noBuyPrice = this.roundToTick(effectiveNoMid - targetOffset, tickNum);
-            const noSellPrice = this.roundToTick(effectiveNoMid + targetOffset, tickNum);
 
             // Validate Prices
             const isValidPrice = (p: number) => p > 0.001 && p < 0.999;
 
             // Two-Sided Requirement: If <0.10 or >0.90, MUST quote both sides
             const needsTwoSided = yesMid < 0.10 || yesMid > 0.90;
-            if (needsTwoSided) {
-                // For 1c strategy, we demand valid BIDS on both sides (User "place buy yes and no")
-                if (!isValidPrice(yesBuyPrice) || !isValidPrice(noBuyPrice)) {
-                    // console.warn(`[Skip] Two-sided required but prices invalid for ${state.gammaMarket.question.slice(0,20)}`);
-                    return;
-                }
-            }
 
             // Budget / Sizing
-            const rawSize = Math.max(state.rewardsMinSize, 20); // Min 20 shares to be safe
-            let size = rawSize;
+            let rawSize = Math.max(state.rewardsMinSize, 20); // Min 20 shares to be safe
 
-            // Calculate Total Cost for Dual Sided Bids
-            const costYes = isValidPrice(yesBuyPrice) ? rawSize * yesBuyPrice * 1.01 : 0;
-            const costNo = isValidPrice(noBuyPrice) ? rawSize * noBuyPrice * 1.01 : 0;
-            const totalCost = costYes + costNo;
+            // Phase 4: Adaptive Scaling (Priority to high-reward markets)
+            const dailyRewards = state.gammaMarket.clobRewards?.[0]?.rewardsDailyRate || 0;
+            const adaptiveMultiplier = Math.sqrt(dailyRewards / REWARDS_CONFIG.RISK_MANAGEMENT.ADAPTIVE_SIZING_BASELINE_REWARDS);
+            rawSize = Math.round(rawSize * Math.max(adaptiveMultiplier, 0.5)); // Min 0.5x scaling
 
-            if (totalCost > availableUSDC) {
-                this.logAction(state.gammaMarket.question, "LOW FUNDS", -1, -1, -1, `Cost $${totalCost.toFixed(2)} > Bal $${availableUSDC.toFixed(2)}. Pausing 2m.`);
-                this.lowBalancePauseUntil = Date.now() + 120000;
-                return;
+            // Phase 5: Temporal Alpha (Time-based risk)
+            const temporalMultiplier = this.getCurrentRiskMultiplier();
+            if (temporalMultiplier !== 1.0) {
+                rawSize = Math.round(rawSize * temporalMultiplier);
             }
 
-            if (size > 0) {
-                // Fetch Share Balances for Sells (prevent "Insufficient Funds" on Sells)
-                let yesShareBal = 0;
-                let noShareBal = 0;
-                try {
-                    const [yBal, nBal] = await Promise.all([
-                        this.clobClient.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: state.yesTokenId }),
-                        this.clobClient.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: state.noTokenId })
-                    ]);
-                    yesShareBal = Number(yBal.balance || 0) / 1e6;
-                    noShareBal = Number(nBal.balance || 0) / 1e6;
-                } catch (e) {
-                    // console.warn("Failed to fetch share balances, defaulting to 0 Sells", e);
+            // Phase 3: Budget-Based Capping
+            // @ts-ignore
+            const mktBudget = state._effectiveBudget || 20;
+            const budgetAdjustedSize = Math.floor(mktBudget); // $1 = 1 share (YES+NO)
+            if (rawSize > budgetAdjustedSize) {
+                // this.logAction(state.gammaMarket.question, "BUDGET", -1, -1, -1, `Capping size ${rawSize} -> ${budgetAdjustedSize} ($${mktBudget.toFixed(0)})`);
+                rawSize = budgetAdjustedSize;
+            }
+
+            // PHASE 2: Dynamic Allocation (Internal Capital Reuse)
+            // Concentrates capital in high-yield T1 markets
+            if (state.score > REWARDS_CONFIG.CAPITAL_EFFICIENCY.CONCENTRATION_THRESHOLD) {
+                const multiplier = 1 + (state.score - REWARDS_CONFIG.CAPITAL_EFFICIENCY.CONCENTRATION_THRESHOLD) / 25;
+                const oldSize = rawSize;
+                rawSize = Math.round(rawSize * Math.min(multiplier, REWARDS_CONFIG.CAPITAL_EFFICIENCY.MAX_CAPITAL_CONCENTRATION));
+                if (rawSize !== oldSize) {
+                    this.logAction(state.gammaMarket.question, "SCALE", -1, -1, -1, `Concentrating capital: ${rawSize} shares (Score: ${state.score.toFixed(1)})`);
+                }
+            }
+
+            // Phase 3: Global Reward Monitor (Log aggregat stats)
+            const now = Date.now();
+            if (now - this.lastGlobalLogTime > REWARDS_CONFIG.SCALING_AND_ROTATION.GLOBAL_REWARD_LOG_INTERVAL_MS) {
+                this.lastGlobalLogTime = now;
+                let totalDailyRewards = 0;
+                for (const s of this.activeMarkets.values()) {
+                    totalDailyRewards += (s.gammaMarket.clobRewards?.[0]?.rewardsDailyRate || 0);
+                }
+                console.log(`\n================================================================================`);
+                console.log(`GLOBAL REWARD MONITOR | Active Markets: ${this.activeMarkets.size} | Total Daily Rewards Est: $${totalDailyRewards.toFixed(2)}`);
+                console.log(`================================================================================\n`);
+            }
+
+            // Fetch Share Balances for Sells (prevent "Insufficient Funds" on Sells)
+            let yesShareBal = 0;
+            let noShareBal = 0;
+            try {
+                const [yBal, nBal] = await Promise.all([
+                    this.clobClient.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: state.yesTokenId }),
+                    this.clobClient.getBalanceAllowance({ asset_type: AssetType.CONDITIONAL, token_id: state.noTokenId })
+                ]);
+                yesShareBal = Number(yBal.balance || 0) / 1e6;
+                noShareBal = Number(nBal.balance || 0) / 1e6;
+            } catch (e) {
+                // console.warn("Failed to fetch share balances, defaulting to 0 Sells", e);
+            }
+
+            const feeRateYes = await this.gammaClient.getFeeRate(state.yesTokenId) || 0;
+            const feeRateNo = await this.gammaClient.getFeeRate(state.noTokenId) || 0;
+
+            // LADDER-BASED ORDER PLACEMENT
+            // Iterate through each ladder level and create orders
+            for (let levelIdx = 0; levelIdx < ladderLevels.length; levelIdx++) {
+                const level = ladderLevels[levelIdx];
+                const levelSize = rawSize * level.sizePercent;
+
+                // Calculate expected score for this level
+                const expectedScore = state.rewardsMaxSpread ? ScoringCalc.calculateScore({
+                    distance: level.distance,
+                    maxSpread: state.rewardsMaxSpread,
+                    size: levelSize
+                }) : 0;
+
+                // Apply asymmetric adjustment if enabled
+                let yesDistance = level.distance;
+                let noDistance = level.distance;
+
+                if (useAsymmetric) {
+                    const yesStrategy = OrderbookAnalyzer.getQuotingStrategy(
+                        yesOb,
+                        yesMid,
+                        level.distance,
+                        REWARDS_CONFIG.REWARD_OPTIMIZATION.ASYMMETRIC_SENSITIVITY
+                    );
+
+                    if (yesStrategy.strategy === 'asymmetric' && yesStrategy.distances) {
+                        yesDistance = yesStrategy.distances.bidDistance;
+                    }
+
+                    const noStrategy = OrderbookAnalyzer.getQuotingStrategy(
+                        noOb,
+                        noMid || (1 - yesMid),
+                        level.distance,
+                        REWARDS_CONFIG.REWARD_OPTIMIZATION.ASYMMETRIC_SENSITIVITY
+                    );
+
+                    if (noStrategy.strategy === 'asymmetric' && noStrategy.distances) {
+                        noDistance = noStrategy.distances.bidDistance;
+                    }
                 }
 
-                const feeRateYes = await this.gammaClient.getFeeRate(state.yesTokenId) || 0;
-                const feeRateNo = await this.gammaClient.getFeeRate(state.noTokenId) || 0;
+                // Calculate Prices for this level
+                const yesBuyPrice = this.roundToTick(yesMid - yesDistance, tickNum);
+                const yesSellPrice = this.roundToTick(yesMid + yesDistance, tickNum);
+
+                const effectiveNoMid = noMid ?? (1 - yesMid);
+                const noBuyPrice = this.roundToTick(effectiveNoMid - noDistance, tickNum);
+                const noSellPrice = this.roundToTick(effectiveNoMid + noDistance, tickNum);
+
+                // Two-sided validation
+                if (needsTwoSided) {
+                    if (!isValidPrice(yesBuyPrice) || !isValidPrice(noBuyPrice)) {
+                        continue; // Skip this level
+                    }
+                }
+
+                // Calculate cost for this level
+                const costYes = isValidPrice(yesBuyPrice) ? levelSize * yesBuyPrice * 1.01 : 0;
+                const costNo = isValidPrice(noBuyPrice) ? levelSize * noBuyPrice * 1.01 : 0;
+                const levelCost = costYes + costNo;
+
+                if (levelCost > availableUSDC) {
+                    // Not enough funds for this level, skip
+                    continue;
+                }
 
                 // YES BUY
                 if (isValidPrice(yesBuyPrice)) {
@@ -859,52 +1258,62 @@ export class RewardsStrategy implements Strategy {
                         tokenID: state.yesTokenId,
                         price: yesBuyPrice,
                         side: Side.BUY,
-                        size,
+                        size: levelSize,
                         feeRateBps: feeRateYes,
-                        _cost: size * yesBuyPrice * 1.01
+                        _cost: levelSize * yesBuyPrice * 1.01,
+                        _ladderLevel: levelIdx,
+                        _expectedScore: expectedScore
                     });
-                    availableUSDC -= (size * yesBuyPrice * 1.01);
+                    availableUSDC -= (levelSize * yesBuyPrice * 1.01);
                 }
+
                 // YES SELL -- Only if we have shares
-                if (isValidPrice(yesSellPrice) && yesShareBal >= size) {
+                if (isValidPrice(yesSellPrice) && yesShareBal >= levelSize) {
                     ordersToPost.push({
                         tokenID: state.yesTokenId,
                         price: yesSellPrice,
                         side: Side.SELL,
-                        size,
+                        size: levelSize,
                         feeRateBps: feeRateYes,
+                        _ladderLevel: levelIdx,
+                        _expectedScore: expectedScore
                     });
                 }
 
                 // NO BUY
                 if (isValidPrice(noBuyPrice)) {
-                    // Check remaining funds? We scaled already, but nice to be safe
-                    if (availableUSDC >= (size * noBuyPrice * 1.01)) {
+                    if (availableUSDC >= (levelSize * noBuyPrice * 1.01)) {
                         ordersToPost.push({
                             tokenID: state.noTokenId,
                             price: noBuyPrice,
                             side: Side.BUY,
-                            size,
+                            size: levelSize,
                             feeRateBps: feeRateNo,
-                            _cost: size * noBuyPrice * 1.01
+                            _cost: levelSize * noBuyPrice * 1.01,
+                            _ladderLevel: levelIdx,
+                            _expectedScore: expectedScore
                         });
-                        availableUSDC -= (size * noBuyPrice * 1.01);
+                        availableUSDC -= (levelSize * noBuyPrice * 1.01);
                     }
                 }
+
                 // NO SELL -- Only if we have shares
-                if (isValidPrice(noSellPrice) && noShareBal >= size) {
+                if (isValidPrice(noSellPrice) && noShareBal >= levelSize) {
                     ordersToPost.push({
                         tokenID: state.noTokenId,
                         price: noSellPrice,
                         side: Side.SELL,
-                        size,
+                        size: levelSize,
                         feeRateBps: feeRateNo,
+                        _ladderLevel: levelIdx,
+                        _expectedScore: expectedScore
                     });
                 }
             }
 
+            // If no orders were created, log and return
             if (ordersToPost.length === 0) {
-                // console.log(`[Warning] No valid orders for ${state.gammaMarket.question.slice(0, 20)}`);
+                this.logAction(state.gammaMarket.question, "SKIP", -1, -1, -1, "No valid orders at ladder levels");
                 return;
             }
 
@@ -912,7 +1321,6 @@ export class RewardsStrategy implements Strategy {
 
             for (let i = 0; i < ordersToPost.length; i++) {
                 const params = ordersToPost[i];
-                const uniqueNonce = ++this.globalNonce; // FIX: Global increment for uniqueness
 
                 // SPREAD VALIDATION (Strict)
                 // SPREAD VALIDATION (Strict via API Mid)
@@ -943,8 +1351,7 @@ export class RewardsStrategy implements Strategy {
                         side: params.side,
                         size: params.size,
                         feeRateBps: params.feeRateBps,
-                        // No expiration for GTC
-
+                        expiration: Math.floor(Date.now() / 1000) + REWARDS_CONFIG.TEMPORAL.GTD_EXPIRY_SECONDS
                     }, {
                         tickSize: String(state.tickSize) as TickSize, // FIX: TickSize must be string
                         negRisk: state.negRisk,
@@ -962,7 +1369,7 @@ export class RewardsStrategy implements Strategy {
 
                 const ordersArg = signedOrders.map(o => ({
                     order: o,
-                    orderType: OrderType.GTC,
+                    orderType: OrderType.GTD,  // GTD supports expiration timestamps
                     postOnly: true
                 }));
 
@@ -994,7 +1401,9 @@ export class RewardsStrategy implements Strategy {
                                 price: input.price,
                                 side: input.side,
                                 size: input.size,
-                                placedAt: Date.now()
+                                placedAt: Date.now(),
+                                ladderLevel: input._ladderLevel,
+                                expectedScore: input._expectedScore
                             });
                         } else if (r.errorMsg) {
                             console.error("Batch Order Error:", r.errorMsg);
@@ -1010,7 +1419,9 @@ export class RewardsStrategy implements Strategy {
                             price: input.price,
                             side: input.side,
                             size: input.size,
-                            placedAt: Date.now()
+                            placedAt: Date.now(),
+                            ladderLevel: input._ladderLevel,
+                            expectedScore: input._expectedScore
                         });
                     }
                 }
@@ -1052,6 +1463,236 @@ export class RewardsStrategy implements Strategy {
 
         } catch (e) {
             console.error(`Order placement failed for ${state.marketId}:`, e);
+        }
+    }
+
+    // --- Position Management (Fill Handling) ---
+    private async runPositionManagement(state: MarketState) {
+        // 1. Sync Inventory (Verify what we actually have)
+        // We do this every loop in managing mode, or throttle it?
+        // Ideally verify every few seconds. For now, trust local + verify.
+
+        // 2. Logic: "Aggressive limit exit"
+        // YES = +100, NO = 0.
+        // Goal: Sell YES.
+
+        const now = Date.now();
+        const fillAge = now - (state.lastFillTime || now);
+
+        // CRITICAL FIX: Trust local inventory for first 10 seconds after fill
+        // API has indexing lag and will return 0 immediately after fill
+        const TRUST_LOCAL_PERIOD_MS = 10000;
+
+        const sideToExit = state.inventory.yes > 1 ? "YES" : (state.inventory.no > 1 ? "NO" : null);
+
+        if (!sideToExit) {
+            // Only verify via API if enough time has passed
+            if (fillAge < TRUST_LOCAL_PERIOD_MS) {
+                console.warn(`[Inventory] Fill too recent (${fillAge}ms). Waiting for API sync...`);
+                return; // Don't switch to QUOTING yet - wait for API to catch up
+            }
+
+            state.mode = "QUOTING";
+            this.logAction(state.gammaMarket.question, "RESUME", -1, -1, -1, "Inventory cleared. Resuming quotes.");
+            return;
+        }
+
+        const tokenId = sideToExit === "YES" ? state.yesTokenId : state.noTokenId;
+        let size = sideToExit === "YES" ? state.inventory.yes : state.inventory.no;
+
+        // Only verify via API after trust period
+        if (fillAge >= TRUST_LOCAL_PERIOD_MS) {
+            try {
+                // @ts-ignore
+                const bal = await this.clobClient.getBalanceAllowance({
+                    asset_type: AssetType.CONDITIONAL,
+                    token_id: tokenId
+                });
+
+                // FIX: Safe parsing with fallback
+                const apiSize = parseFloat(bal.balance || "0") / 1e6;
+                const allowance = parseFloat(bal.allowance || "0") / 1e6;
+
+                console.log(`[Inventory] ${sideToExit} API: ${apiSize.toFixed(2)}, Local: ${size.toFixed(2)}, Allow: ${allowance.toFixed(2)}`);
+
+                // Use MAX of local and API (API might still be behind)
+                if (apiSize > size) size = apiSize;
+
+                // Sync local
+                if (sideToExit === "YES") state.inventory.yes = size;
+                else state.inventory.no = size;
+
+                // Check allowance
+                if (size > 0.1 && (isNaN(allowance) || allowance < size)) {
+                    console.log(`[Inventory] Approving ${tokenId}...`);
+                    // @ts-ignore
+                    await this.clobClient.updateBalanceAllowance({
+                        asset_type: AssetType.CONDITIONAL,
+                        token_id: tokenId
+                    });
+                }
+            } catch (e) {
+                console.warn(`[Inventory] API check failed, using local: ${size}`, e);
+            }
+        } else {
+            console.log(`[Inventory] Using local state (fill ${fillAge}ms ago): ${sideToExit} = ${size.toFixed(2)}`);
+        }
+
+        if (size < 0.1) {
+            state.mode = "QUOTING";
+            this.logAction(state.gammaMarket.question, "RESUME", -1, -1, -1, "Inventory empty.");
+            return;
+        }
+
+        // --- PHASE 2: CTF MERGE INTEGRATION ---
+        if (REWARDS_CONFIG.CAPITAL_EFFICIENCY.ENABLE_MERGE && state.inventory.yes > 0.1 && state.inventory.no > 0.1) {
+            const amountToMerge = Math.min(state.inventory.yes, state.inventory.no);
+            this.logAction(state.gammaMarket.question, "MERGE", -1, -1, -1, `Merging ${amountToMerge.toFixed(2)} YES+NO back to USDC`);
+            try {
+                // @ts-ignore
+                await mergePositions(state.gammaMarket.conditionId, amountToMerge, this.relayClient);
+                state.inventory.yes -= amountToMerge;
+                state.inventory.no -= amountToMerge;
+
+                // Refresh size after merge
+                size = sideToExit === "YES" ? state.inventory.yes : state.inventory.no;
+                if (size < 0.1) {
+                    state.mode = "QUOTING";
+                    // Cancel all remaining orders for this market
+                    const allIds = state.orders.map(o => o.orderId);
+                    if (allIds.length > 0) {
+                        await this.clobClient.cancelOrders(allIds);
+                        state.orders = [];
+                    }
+                    this.logAction(state.gammaMarket.question, "RESUME", -1, -1, -1, "Inventory cleared via Merge.");
+                    return;
+                }
+            } catch (e) {
+                console.error(`[Merge] Failed for ${state.marketId}:`, e);
+            }
+        }
+
+        const tick = Number(state.tickSize) || 0.01;
+
+        // 1. EXIT ORDER (The side we hold)
+        const exitTokenId = tokenId;
+        const exitOb = await this.getOrderBookCached(exitTokenId);
+        if (exitOb) {
+            const bestBid = Number(exitOb.bids[0]?.price || 0);
+            const bestAsk = Number(exitOb.asks[0]?.price || 1);
+            const validAsk = exitOb.asks.length > 0;
+
+            let exitPrice: number;
+            if (validAsk) {
+                const mid = (bestBid + bestAsk) / 2;
+                exitPrice = Math.min(bestAsk, mid + 0.005);
+            } else {
+                exitPrice = bestBid + 0.02;
+            }
+
+            if (fillAge > 5000) {
+                if (validAsk) {
+                    const mid = (bestBid + bestAsk) / 2;
+                    exitPrice = mid - 0.002;
+                    if (exitPrice < bestBid + 0.001) exitPrice = bestBid + 0.001;
+                } else {
+                    exitPrice = bestBid + 0.005;
+                }
+            }
+
+            if (fillAge > 30000) {
+                exitPrice = bestBid;
+                this.logAction(state.gammaMarket.question, "DUMP", -1, -1, -1, `Emergency Exit after 30s. Px ${exitPrice}`);
+            }
+
+            exitPrice = Math.round(exitPrice / tick) * tick;
+            const existingExit = state.orders.find(o => o.tokenId === exitTokenId && o.side === Side.SELL);
+
+            if (existingExit) {
+                if (Math.abs(existingExit.price - exitPrice) >= tick) {
+                    this.logAction(state.gammaMarket.question, "UPDATE", -1, exitPrice, -1, `Updating Exit from ${existingExit.price} to ${exitPrice}`);
+                    try {
+                        // @ts-ignore
+                        await this.clobClient.cancelOrder({ orderID: existingExit.orderId });
+                        state.orders = state.orders.filter(o => o.orderId !== existingExit.orderId);
+                    } catch (e) { }
+                }
+            } else {
+                try {
+                    this.logAction(state.gammaMarket.question, "EXIT", -1, exitPrice, -1, `Exiting ${sideToExit} ${size.toFixed(1)} @ ${exitPrice}`);
+                    const postOnly = fillAge < 30000;
+                    // @ts-ignore
+                    const order = await this.clobClient.createOrder({
+                        tokenID: exitTokenId,
+                        price: exitPrice,
+                        side: Side.SELL,
+                        size: size,
+                        feeRateBps: 0,
+                    }, { tickSize: state.tickSize });
+                    // @ts-ignore
+                    const posted = await this.clobClient.postOrder(order, postOnly ? OrderType.GTC : OrderType.FOK);
+                    if (posted?.orderID) {
+                        state.orders.push({ orderId: posted.orderID, tokenId: exitTokenId, price: exitPrice, side: Side.SELL, size, placedAt: Date.now() });
+                    }
+                } catch (e) { console.error("Exit placement failed:", e); }
+            }
+        }
+
+        // 2. RECYCLING ORDER (The opposite side)
+        if (REWARDS_CONFIG.CAPITAL_EFFICIENCY.ENABLE_RECYCLING && fillAge < 60000) { // Only recycle for first 60s
+            const oppositeSide = sideToExit === "YES" ? "NO" : "YES";
+            const recycleTokenId = oppositeSide === "YES" ? state.yesTokenId : state.noTokenId;
+            const recycleOb = await this.getOrderBookCached(recycleTokenId);
+
+            if (recycleOb) {
+                const bestBid = Number(recycleOb.bids[0]?.price || 0);
+                const bestAsk = Number(recycleOb.asks[0]?.price || 1);
+                const mid = (bestBid + bestAsk) / 2;
+
+                // Use tightest ladder level for recycling
+                const recycleDistance = REWARDS_CONFIG.REWARD_OPTIMIZATION.LADDER_LEVELS[0].distance;
+                let recyclePrice = Math.round((mid - recycleDistance) / tick) * tick;
+                if (recyclePrice < 0.01) recyclePrice = 0.01;
+
+                const existingRecycle = state.orders.find(o => o.tokenId === recycleTokenId && o.side === Side.BUY);
+
+                if (existingRecycle) {
+                    if (Math.abs(existingRecycle.price - recyclePrice) >= tick) {
+                        this.logAction(state.gammaMarket.question, "UPDATE", -1, recyclePrice, -1, `Updating Recycle ${oppositeSide} to ${recyclePrice}`);
+                        try {
+                            // @ts-ignore
+                            await this.clobClient.cancelOrder({ orderID: existingRecycle.orderId });
+                            state.orders = state.orders.filter(o => o.orderId !== existingRecycle.orderId);
+                        } catch (e) { }
+                    }
+                } else {
+                    // Check balance for recycling (fetch only if needed)
+                    try {
+                        const balRes = await this.clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+                        const available = parseFloat(balRes.balance) / 1e6;
+                        const recycleSize = Math.max(state.rewardsMinSize, 20);
+                        const cost = recycleSize * recyclePrice * 1.01;
+
+                        if (available > cost) {
+                            this.logAction(state.gammaMarket.question, "RECYCLE", -1, recyclePrice, -1, `Recycling ${oppositeSide} ${recycleSize} @ ${recyclePrice}`);
+                            // @ts-ignore
+                            const order = await this.clobClient.createOrder({
+                                tokenID: recycleTokenId,
+                                price: recyclePrice,
+                                side: Side.BUY,
+                                size: recycleSize,
+                                feeRateBps: 0,
+                                expiration: Math.floor(Date.now() / 1000) + REWARDS_CONFIG.TEMPORAL.GTD_EXPIRY_SECONDS
+                            }, { tickSize: state.tickSize });
+                            // @ts-ignore
+                            const posted = await this.clobClient.postOrder(order, OrderType.GTD);
+                            if (posted?.orderID) {
+                                state.orders.push({ orderId: posted.orderID, tokenId: recycleTokenId, price: recyclePrice, side: Side.BUY, size: recycleSize, placedAt: Date.now() });
+                            }
+                        }
+                    } catch (e) { console.error("Recycle placement failed:", e); }
+                }
+            }
         }
     }
 }

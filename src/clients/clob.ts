@@ -4,7 +4,10 @@ import { CONFIG } from "./config.js";
 
 import { providers } from "ethers";
 
-export async function createClobClient(): Promise<ClobClient> {
+// Define interface for return
+import { ApiKeyCreds } from "@polymarket/clob-client";
+
+export async function createClobClient(): Promise<{ client: ClobClient, creds: ApiKeyCreds }> {
     const provider = new providers.JsonRpcProvider(CONFIG.RPC_URL);
     const signer = new Wallet(CONFIG.PRIVATE_KEY, provider);
     const chainId = CONFIG.CHAIN_ID || 137;
@@ -13,7 +16,7 @@ export async function createClobClient(): Promise<ClobClient> {
 
     // same logic as poly-all-in-one: Init with L1 to get creds, then L2
     const tempClient = new ClobClient(CONFIG.HOST, chainId, signer);
-    let apiCreds;
+    let apiCreds: ApiKeyCreds;
 
     try {
         apiCreds = await tempClient.deriveApiKey();
@@ -29,12 +32,8 @@ export async function createClobClient(): Promise<ClobClient> {
 
     if (proxyAddress) {
         console.log(`[ClobClient] Using Proxy Address: ${proxyAddress} (SignatureType=2)`);
-        // Gnosis Safe / Proxy Usage
-        // import { SignatureType } from "@polymarket/clob-client"; // Removed nested import
 
-        // ...
-
-        return new ClobClient(
+        const client = new ClobClient(
             CONFIG.HOST,
             chainId,
             signer,
@@ -42,13 +41,15 @@ export async function createClobClient(): Promise<ClobClient> {
             2, // SignatureType.GnosisSafe
             proxyAddress
         );
+        return { client, creds: apiCreds };
     }
 
     // Standard EOA Usage
-    return new ClobClient(
+    const client = new ClobClient(
         CONFIG.HOST,
         chainId,
         signer,
         apiCreds
     );
+    return { client, creds: apiCreds };
 }

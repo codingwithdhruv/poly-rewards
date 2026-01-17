@@ -50,15 +50,14 @@ async function main() {
     }
 
     console.log("Initializing CLOB client...");
-    const clobClient = await createClobClient(); // No args
+    const { client: clobClient, creds } = await createClobClient(); // Unpack
 
-    // 3. Strategy
     // 3. Strategy
     console.log(`Initializing Rewards Strategy${args.custom ? ` [Custom Mode: "${args.custom}"]` : ""}...`);
     const customSpread = args.mid ? Number(args.mid) / 100 : undefined;
     const customAvoid = args.sl ? Number(args.sl) / 100 : undefined;
 
-    const strategy = new RewardsStrategy(args.custom, customSpread, customAvoid);
+    const strategy = new RewardsStrategy(args.custom, customSpread, customAvoid, creds);
 
 
     // 4. Bot
