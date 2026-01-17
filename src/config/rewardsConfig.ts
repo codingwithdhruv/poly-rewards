@@ -119,7 +119,7 @@ export const REWARDS_CONFIG = {
 
     // 9️⃣ Temporal & Advanced (Phase 5)
     TEMPORAL: {
-        GTD_EXPIRY_SECONDS: 120,           // 2 mins (Phase 16: Reduced from 300 for sticky refresh)
+        GTD_EXPIRY_SECONDS: 1800,          // 30 mins (Increased from 5/2 mins as per user request)
         ENABLE_TEMPORAL_ALPHA: true,
         // Hours (0-23) ET? We'll assume local system time for now.
         // Low activity periods where we are more opportunistic
