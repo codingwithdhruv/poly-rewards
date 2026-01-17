@@ -63,7 +63,14 @@ export const REWARDS_CONFIG = {
     // Fill Avoidance
     FILL_AVOIDANCE: {
         MIN_DISTANCE_TO_MID: 0.005, // 0.5 cents
-        CHECK_INTERVAL_MS: 3000
+        CHECK_INTERVAL_MS: 3000,
+        // Phase 16: Temporal Persistence
+        // Minimum time an order must live before "Soft Drift" cancellation
+        MIN_QUOTE_LIFETIME_MS: 30_000,
+        DRIFT: {
+            SOFT_THRESHOLD: 0.50, // 50% of spread
+            HARD_THRESHOLD: 0.15, // 15% of spread (Emergency)
+        }
     },
 
     // 4️⃣ Scaling & Rotation (Phase 3)
@@ -78,6 +85,7 @@ export const REWARDS_CONFIG = {
     // 5️⃣ Reward Optimization (Quadratic Scoring)
     REWARD_OPTIMIZATION: {
         USE_LADDER: true,
+        MID_TOLERANCE_TICKS: 2, // Only reprice if mid moves > 2 ticks
         LADDER_LEVELS: [
             { distance: 0.005, sizePercent: 0.70 },
             { distance: 0.010, sizePercent: 0.30 }
@@ -111,7 +119,7 @@ export const REWARDS_CONFIG = {
 
     // 9️⃣ Temporal & Advanced (Phase 5)
     TEMPORAL: {
-        GTD_EXPIRY_SECONDS: 300,           // 5 minute hard expiry
+        GTD_EXPIRY_SECONDS: 120,           // 2 mins (Phase 16: Reduced from 300 for sticky refresh)
         ENABLE_TEMPORAL_ALPHA: true,
         // Hours (0-23) ET? We'll assume local system time for now.
         // Low activity periods where we are more opportunistic
@@ -143,6 +151,7 @@ export const REWARDS_CONFIG = {
             MODERATE: 0.010,   // 1.0¢
             DEFENSIVE: 0.015   // 1.5¢
         },
-        HYSTERESIS_CYCLES: 2   // Cycles to sustain before changing
+        HYSTERESIS_CYCLES: 2,   // Cycles to sustain before changing
+        REPLENISH_THRESHOLD_USDC_PER_SEC: 1000 // Phase 18: $1000/sec inflow overrides thin depth
     }
 };

@@ -65,7 +65,14 @@ interface MarketState {
         noDistance: number;
         yesExhaustionCycles: number; // Consecutive cycles with low depth
         noExhaustionCycles: number;
+        // Phase 18: Replenishment Tracking
+        yesLastDepth1?: number;
+        yesLastDepthTs?: number;
+        noLastDepth1?: number;
+        noLastDepthTs?: number;
     };
+    // Phase 16: Midpoint Tolerance
+    lastQuotedMid?: number;
 }
 
 
@@ -888,18 +895,33 @@ export class RewardsStrategy implements Strategy {
 
             // FIX 1: Hard Cap Active Markets by effectiveMinCap (1.05x buffer)
             const availableForTrading = Number((await this.clobClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL })).balance) / 1e6; // Refresh balance
+
+            // Phase 17 Issue #1: Wallet-Aware Selection (Pre-filter poison markets)
+            const MAX_ACCEPTABLE_MIN_SHARES = availableForTrading < 150 ? 50 : (availableForTrading < 300 ? 100 : 200);
+
+            // Filter out markets too large for this wallet
+            const walletAdjustedCandidates = validCandidates.filter(c => {
+                if (c.rewardsMinSize > MAX_ACCEPTABLE_MIN_SHARES) return false;
+                return true;
+            });
+
             let globalMaxCapReq = 0;
 
-            validCandidates.forEach(c => {
-                const midPriceSum = (c.yesPrice ?? 0.5) + (c.noPrice ?? 0.5);
-                const effectiveMinCap = c.rewardsMinSize * midPriceSum * 1.05; // 5% buffer
+            walletAdjustedCandidates.forEach(c => {
+                // Phase 17 Issue #2: Robust Capital Calculation (Worst-Case Edge)
+                // Use max spread to find worst-case execution price (Pessimistic Affordability)
+                const maxSpread = Math.min((REWARDS_CONFIG.TIER_1.MAX_SPREAD_CENTS / 100) || 0.10, 0.10); // Cap at 10 cents
+                const worstYes = Math.min((c.yesPrice ?? 0.5) + maxSpread, 0.999);
+                const worstNo = Math.min((c.noPrice ?? 0.5) + maxSpread, 0.999);
+
+                const effectiveMinCap = c.rewardsMinSize * (worstYes + worstNo) * 1.05; // 5% buffer on top of worst case
                 c.minCapitalRequired = effectiveMinCap;
                 if (effectiveMinCap > globalMaxCapReq) globalMaxCapReq = effectiveMinCap;
             });
 
             // FIX 1: Unified Capital-Consuming Selection Loop
             // Sort by CES (Small Wallet Gems are already boosted 2x in validCandidates loop)
-            const sortedByCES = [...validCandidates].sort((a, b) => (b.capitalEfficiencyScore || 0) - (a.capitalEfficiencyScore || 0));
+            const sortedByCES = [...walletAdjustedCandidates].sort((a, b) => (b.capitalEfficiencyScore || 0) - (a.capitalEfficiencyScore || 0));
 
             const selectedMarkets: MarketState[] = [];
             // Use fresh availableForTrading derived above
@@ -1054,17 +1076,41 @@ export class RewardsStrategy implements Strategy {
                 // CHECK 1: GLOBAL SPREAD TOO TIGHT? - REMOVED (User only wants distance check)
                 // if (currentSpread < distThreshold) { ... }
 
-                // CHECK 2: INDIVIDUAL ORDERS TOO CLOSE?
+                // CHECK 2: INDIVIDUAL ORDERS TOO CLOSE? (Phase 16 Split Drift)
                 if (!triggered) {
                     for (const order of state.orders) {
                         const mid = order.tokenId === state.yesTokenId ? yesMidVal : noMidVal;
-                        // const mid = midInfo.mid; // Old OB logic
                         const dist = Math.abs(order.price - mid);
 
-                        if (dist <= distThreshold) {
-                            this.logAction(state.gammaMarket.question, "DRIFT", -1, -1, distThreshold, `Order ${order.price} too close to ${mid.toFixed(4)}. Dist ${dist.toFixed(4)}`);
+                        // Phase 16: Temporal Persistence
+                        const age = Date.now() - (order.placedAt || 0);
+                        const softLimit = distThreshold;
+
+                        // Phase 17 Issue #4: Absolute Drift Floor (Prevent sub-tick cancels in calm markets)
+                        const tickVal = Number(state.tickSize) || 0.01;
+                        const absoluteFloor = tickVal * 2;
+                        // Use MAX of (AbsoluteFloor, RelativeTight)
+                        const hardLimit = Math.max(absoluteFloor, distThreshold * 0.15);
+
+                        if (dist <= hardLimit) {
+                            this.logAction(state.gammaMarket.question, "DRIFT", -1, -1, hardLimit, `HARD DRIFT: ${order.price} vs ${mid.toFixed(4)}. Dist ${dist.toFixed(4)}`);
                             triggered = true;
-                            break; // One breach kills all
+                            break; // Emergency Kill
+                        }
+
+                        if (dist <= softLimit) {
+                            // Soft Drift - Check Grace Period
+                            if (age > REWARDS_CONFIG.FILL_AVOIDANCE.MIN_QUOTE_LIFETIME_MS) {
+                                this.logAction(state.gammaMarket.question, "DRIFT", -1, -1, softLimit, `SOFT DRIFT (Expired Grace): ${order.price} vs ${mid.toFixed(4)}. Age ${age}ms`);
+                                triggered = true;
+                                break;
+                            } else {
+                                // Grace Period - Do NOT cancel
+                                // Log occasionally?
+                                if (Math.random() < 0.05) {
+                                    // console.log(`[Rewards] Soft Drift Grace for ${state.gammaMarket.question.slice(0, 20)}: Dist ${dist.toFixed(4)} < ${softLimit.toFixed(4)} but Age ${age}ms < 30s`);
+                                }
+                            }
                         }
                     }
                 }
@@ -1228,40 +1274,74 @@ export class RewardsStrategy implements Strategy {
                 const updatePressureState = (
                     currentDepth: DepthBands,
                     currentDist: number,
-                    cycles: number
-                ): { dist: number, cycles: number } => {
+                    cycles: number,
+                    lastDepth1?: number,
+                    lastDepthTs?: number
+                ): { dist: number, cycles: number, lastDepth1: number, lastDepthTs: number } => {
                     let targetDist = LP_CONFIG.DISTANCES.AGGRESSIVE;
+
+                    // Phase 18: Replenishment Logic
+                    const now = Date.now();
+                    let isReplenishingFast = false;
+
+                    if (lastDepth1 !== undefined && lastDepthTs !== undefined) {
+                        const deltaDepth = currentDepth.layer1 - lastDepth1;
+                        const deltaTimeSeciles = (now - lastDepthTs) / 1000;
+                        if (deltaTimeSeciles > 0) {
+                            const rate = deltaDepth / deltaTimeSeciles;
+                            if (rate > (LP_CONFIG.REPLENISH_THRESHOLD_USDC_PER_SEC || 99999)) {
+                                isReplenishingFast = true;
+                                // console.log(`[Replenish] Firing! Rate $${rate.toFixed(0)}/s > Threshold`);
+                            }
+                        }
+                    }
 
                     // Check Aggressive Layer (0.5c)
                     if (currentDepth.layer1 < MIN_DEPTH) {
-                        // Too thin? Check Moderate (1.0c)
-                        if (currentDepth.layer2 < MIN_DEPTH) {
-                            targetDist = LP_CONFIG.DISTANCES.DEFENSIVE;
+                        // Too thin? Usually retreat.
+                        // BUT: If replenishing fast, stay aggressive/moderate
+                        if (isReplenishingFast) {
+                            targetDist = LP_CONFIG.DISTANCES.MODERATE; // Compromise: Moderate instead of Defensive
                         } else {
-                            targetDist = LP_CONFIG.DISTANCES.MODERATE;
+                            // Check Moderate (1.0c)
+                            if (currentDepth.layer2 < MIN_DEPTH) {
+                                targetDist = LP_CONFIG.DISTANCES.DEFENSIVE;
+                            } else {
+                                targetDist = LP_CONFIG.DISTANCES.MODERATE;
+                            }
                         }
                     }
 
                     // Apply Hysteresis: Only change if condition persists
                     // If target differs from current, increment counter
+                    let nextCycles = cycles;
+                    let nextDist = currentDist;
+
                     if (targetDist !== currentDist) {
                         if (cycles + 1 >= LP_CONFIG.HYSTERESIS_CYCLES) {
-                            return { dist: targetDist, cycles: 0 }; // Change & Reset
+                            nextDist = targetDist;
+                            nextCycles = 0; // Change & Reset
+                        } else {
+                            nextCycles = cycles + 1; // Wait
                         }
-                        return { dist: currentDist, cycles: cycles + 1 }; // Wait
+                    } else {
+                        nextCycles = 0; // Reset if stable
                     }
 
-                    // If target same as current, keep it and reset cycle count (metrics improved or stayed same)
-                    return { dist: currentDist, cycles: 0 };
+                    return { dist: nextDist, cycles: nextCycles, lastDepth1: currentDepth.layer1, lastDepthTs: now };
                 };
 
-                const yesUpdate = updatePressureState(yesDepth, state.pressureState.yesDistance, state.pressureState.yesExhaustionCycles);
+                const yesUpdate = updatePressureState(yesDepth, state.pressureState.yesDistance, state.pressureState.yesExhaustionCycles, state.pressureState.yesLastDepth1, state.pressureState.yesLastDepthTs);
                 state.pressureState.yesDistance = yesUpdate.dist;
                 state.pressureState.yesExhaustionCycles = yesUpdate.cycles;
+                state.pressureState.yesLastDepth1 = yesUpdate.lastDepth1;
+                state.pressureState.yesLastDepthTs = yesUpdate.lastDepthTs;
 
-                const noUpdate = updatePressureState(noDepth, state.pressureState.noDistance, state.pressureState.noExhaustionCycles);
+                const noUpdate = updatePressureState(noDepth, state.pressureState.noDistance, state.pressureState.noExhaustionCycles, state.pressureState.noLastDepth1, state.pressureState.noLastDepthTs);
                 state.pressureState.noDistance = noUpdate.dist;
                 state.pressureState.noExhaustionCycles = noUpdate.cycles;
+                state.pressureState.noLastDepth1 = noUpdate.lastDepth1;
+                state.pressureState.noLastDepthTs = noUpdate.lastDepthTs;
 
                 // Log Significant Moves (Retreats)
                 if (yesUpdate.cycles === 0 && yesUpdate.dist > 0.005 && yesUpdate.dist > state.pressureState.yesDistance) {
@@ -1353,6 +1433,18 @@ export class RewardsStrategy implements Strategy {
                 return;
             }
 
+            // Phase 16: Midpoint Tolerance
+            const currentMid = yesMid ?? 0.5;
+            if (state.lastQuotedMid !== undefined && state.orders.length > 0) {
+                const diff = Math.abs(currentMid - state.lastQuotedMid);
+                const tolerance = (Number(state.tickSize) || 0.01) * (REWARDS_CONFIG.REWARD_OPTIMIZATION.MID_TOLERANCE_TICKS || 2);
+                if (diff <= tolerance) {
+                    // Mid hasn't moved enough, prevent churn
+                    return;
+                }
+            }
+            state.lastQuotedMid = currentMid;
+
 
             const tickNum = Number(state.tickSize);
 
@@ -1391,6 +1483,26 @@ export class RewardsStrategy implements Strategy {
             // FIX 3: Correct Budget Capping (Cost per Share)
             // Use actual mid prices + 1% buffer
             const costPerShare = (yesMid ?? 0.5) + (noMid ?? 0.5);
+            /* const budgetAdjustedSize = Math.floor(mktBudget / (costPerShare * 1.01)); */ // Moved down
+
+            // Phase 17 Issue #3: Early Ladder Locking (Invariant Enforcement)
+            // Check if we can afford the FULL ladder structure at MINIMUM sizes
+            if (useLadder) {
+                const maxAffordableShares = Math.floor(mktBudget / (costPerShare * 1.01));
+                const maxLevelSizePercent = Math.max(...ladderLevels.map(l => l.sizePercent));
+                // Inverse: If we have maxAffordableQuotes, is it enough to satisfy minShares for the largest rung?
+                // rawSize * pct >= minShares  => rawSize >= minShares / pct
+                const minRawSizeRequiredForLadder = Math.ceil(state.rewardsMinSize / maxLevelSizePercent);
+
+                if (maxAffordableShares < minRawSizeRequiredForLadder) {
+                    // We cannot afford a multi-rung ladder while respecting minShares validly.
+                    // Collapse to single defensive order immediately.
+                    ladderLevels = [{ distance: ladderLevels[0].distance, sizePercent: 1.0 }];
+                    // console.log(`[Ladder] Early Collapse: Budget ${mktBudget} allows ${maxAffordableShares} shares < LadderReq ${minRawSizeRequiredForLadder}`);
+                }
+            }
+
+            // Recalculate size limit based on budget (standard)
             const budgetAdjustedSize = Math.floor(mktBudget / (costPerShare * 1.01));
 
             if (rawSize > budgetAdjustedSize) {
