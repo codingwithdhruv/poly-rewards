@@ -118,6 +118,7 @@ export class RewardsStrategy implements Strategy {
     // WS Client
     private ws: WebSocket | null = null;
     private creds?: ApiKeyCreds;
+    private pingInterval: NodeJS.Timeout | null = null; // Phase 23: Proactive PING
 
     // Custom Filter for single market mode
     private customFilter?: string;
@@ -195,8 +196,9 @@ export class RewardsStrategy implements Strategy {
                 }
             };
             this.ws?.send(JSON.stringify(authMsg));
-            // Keep alive: Server sends PING, we reply PONG (handled in on('message'))
-            // We do NOT need to send active pings, which causes INVALID OPERATION.
+
+            // Phase 23: Start proactive PING to keep connection alive
+            this.startPingInterval();
         });
 
         this.ws.on("message", (data: any) => {
@@ -227,8 +229,26 @@ export class RewardsStrategy implements Strategy {
         this.ws.on("error", (err) => console.error("[WS] Connection Error:", err));
         this.ws.on("close", () => {
             console.warn("[WS] Closed. Reconnecting in 5s...");
+            this.stopPingInterval(); // Phase 23: Clean up interval
             setTimeout(() => this.initUserStream(), 5000);
         });
+    }
+
+    // Phase 23: Proactive PING to keep WebSocket alive
+    private startPingInterval() {
+        this.stopPingInterval(); // Clear any existing
+        this.pingInterval = setInterval(() => {
+            if (this.ws?.readyState === WebSocket.OPEN) {
+                this.ws.send("PING");
+            }
+        }, 10000); // Every 10 seconds
+    }
+
+    private stopPingInterval() {
+        if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+            this.pingInterval = null;
+        }
     }
 
     private handleFill(msg: any) {
@@ -279,6 +299,12 @@ export class RewardsStrategy implements Strategy {
             // Switch to Managing Mode immediately
             foundState.mode = "MANAGING";
             foundState.lastFillTime = Date.now();
+
+            // Phase 22: CRITICAL - Initialize inventory if undefined
+            if (!foundState.inventory) {
+                foundState.inventory = { yes: 0, no: 0 };
+            }
+
             // Update estimated inventory (API sync verifies later)
             const size = parseFloat(msg.size);
             if (msg.side === "BUY") {
@@ -288,6 +314,9 @@ export class RewardsStrategy implements Strategy {
                 if (isYes) foundState.inventory.yes -= size;
                 else foundState.inventory.no -= size;
             }
+
+            // Phase 22: DEBUG - Log inventory state
+            console.log(`[FILL] Inventory after: YES=${foundState.inventory.yes.toFixed(2)}, NO=${foundState.inventory.no.toFixed(2)}`);
         }
     }
 
@@ -979,9 +1008,19 @@ export class RewardsStrategy implements Strategy {
                 }
             }
 
-            // Cancel orders for dropped
+            // Phase 21: Cancel orders for dropped - BUT PROTECT MARKETS WITH INVENTORY
             for (const [id, state] of this.activeMarkets.entries()) {
                 if (!newActiveMarkets.has(id)) {
+                    // CRITICAL: Don't rotate out if we have inventory to manage
+                    const hasInventory = (state.inventory?.yes || 0) > 0.1 || (state.inventory?.no || 0) > 0.1;
+                    const isManaging = state.mode === "MANAGING";
+
+                    if (hasInventory || isManaging) {
+                        console.log(`[PROTECTED] Keeping ${state.gammaMarket.question.slice(0, 40)} - has inventory (YES: ${state.inventory?.yes?.toFixed(2) || 0}, NO: ${state.inventory?.no?.toFixed(2) || 0})`);
+                        newActiveMarkets.set(id, state);  // Keep it in active markets
+                        continue;
+                    }
+
                     console.log(`Rotating out market: ${state.gammaMarket.question}`);
                     await this.cancelMarketOrders(state);
                 }
@@ -1305,15 +1344,36 @@ export class RewardsStrategy implements Strategy {
                 state.tradeVelocity.usdcPerSecond = tradeRateUSDC;
                 state.tradeVelocity.lastUpdate = now;
 
-                // Helper for Hysteresis Logic with TTC Model
+                // Phase 20: Calculate Current Spread from Orderbook
+                const yesBestBid = yesOb.bids[0]?.price || yesMidLive;
+                const yesBestAsk = yesOb.asks[0]?.price || yesMidLive;
+                const yesSpread = Math.abs(yesBestAsk - yesBestBid);
+
+                const noBestBid = noOb.bids[0]?.price || noMidLive;
+                const noBestAsk = noOb.asks[0]?.price || noMidLive;
+                const noSpread = Math.abs(noBestAsk - noBestBid);
+
+                // Helper for Hysteresis Logic with TTC Model + Spread-Relative Distances
                 const updatePressureState = (
                     currentDepth: DepthBands,
                     currentDist: number,
                     cycles: number,
+                    currentSpread: number,
                     lastDepth1?: number,
                     lastDepthTs?: number
                 ): { dist: number, cycles: number, lastDepth1: number, lastDepthTs: number } => {
-                    let targetDist = LP_CONFIG.DISTANCES.AGGRESSIVE;
+                    // Phase 20: Calculate spread-relative distances with safety bounds
+                    const MIN = LP_CONFIG.MIN_DISTANCE_CENTS || 0.002;
+                    const MAX = Math.min(
+                        LP_CONFIG.MAX_DISTANCE_CENTS || 0.015,
+                        state.rewardsMaxSpread || 0.05
+                    );
+
+                    const aggressiveDist = Math.max(MIN, Math.min(currentSpread * (LP_CONFIG.SPREAD_MULTIPLIERS?.AGGRESSIVE || 1.0), MAX));
+                    const moderateDist = Math.max(MIN, Math.min(currentSpread * (LP_CONFIG.SPREAD_MULTIPLIERS?.MODERATE || 1.5), MAX));
+                    const defensiveDist = Math.max(MIN, Math.min(currentSpread * (LP_CONFIG.SPREAD_MULTIPLIERS?.DEFENSIVE || 2.0), MAX));
+
+                    let targetDist = aggressiveDist;
 
                     // Phase 18: Replenishment Logic
                     const now = Date.now();
@@ -1346,13 +1406,13 @@ export class RewardsStrategy implements Strategy {
                         effectiveTTC_0_5c = effectiveDepth / tradeRateUSDC;
                     }
 
-                    // Select distance based on TTC safety horizons
+                    // Select distance based on TTC safety horizons (Phase 20: now spread-relative)
                     if (effectiveTTC_0_5c >= LP_CONFIG.TTC_SAFETY_HORIZONS.AGGRESSIVE) {
-                        targetDist = LP_CONFIG.DISTANCES.AGGRESSIVE; // 0.5¢
+                        targetDist = aggressiveDist; // Spread-relative aggressive
                     } else if (TTC_1_0c >= LP_CONFIG.TTC_SAFETY_HORIZONS.MODERATE) {
-                        targetDist = LP_CONFIG.DISTANCES.MODERATE; // 1.0¢
+                        targetDist = moderateDist; // Spread-relative moderate
                     } else {
-                        targetDist = LP_CONFIG.DISTANCES.DEFENSIVE; // 1.5¢
+                        targetDist = defensiveDist; // Spread-relative defensive
                     }
 
                     // Apply Hysteresis: Only change if condition persists
@@ -1374,13 +1434,13 @@ export class RewardsStrategy implements Strategy {
                     return { dist: nextDist, cycles: nextCycles, lastDepth1: currentDepth.layer1, lastDepthTs: now };
                 };
 
-                const yesUpdate = updatePressureState(yesDepth, state.pressureState.yesDistance, state.pressureState.yesExhaustionCycles, state.pressureState.yesLastDepth1, state.pressureState.yesLastDepthTs);
+                const yesUpdate = updatePressureState(yesDepth, state.pressureState.yesDistance, state.pressureState.yesExhaustionCycles, yesSpread, state.pressureState.yesLastDepth1, state.pressureState.yesLastDepthTs);
                 state.pressureState.yesDistance = yesUpdate.dist;
                 state.pressureState.yesExhaustionCycles = yesUpdate.cycles;
                 state.pressureState.yesLastDepth1 = yesUpdate.lastDepth1;
                 state.pressureState.yesLastDepthTs = yesUpdate.lastDepthTs;
 
-                const noUpdate = updatePressureState(noDepth, state.pressureState.noDistance, state.pressureState.noExhaustionCycles, state.pressureState.noLastDepth1, state.pressureState.noLastDepthTs);
+                const noUpdate = updatePressureState(noDepth, state.pressureState.noDistance, state.pressureState.noExhaustionCycles, noSpread, state.pressureState.noLastDepth1, state.pressureState.noLastDepthTs);
                 state.pressureState.noDistance = noUpdate.dist;
                 state.pressureState.noExhaustionCycles = noUpdate.cycles;
                 state.pressureState.noLastDepth1 = noUpdate.lastDepth1;
@@ -1954,7 +2014,8 @@ export class RewardsStrategy implements Strategy {
         // API has indexing lag and will return 0 immediately after fill
         const TRUST_LOCAL_PERIOD_MS = 10000;
 
-        const sideToExit = state.inventory.yes > 1 ? "YES" : (state.inventory.no > 1 ? "NO" : null);
+        // Phase 22: Lowered threshold from > 1 to > 0.1 to catch smaller fills
+        const sideToExit = state.inventory.yes > 0.1 ? "YES" : (state.inventory.no > 0.1 ? "NO" : null);
 
         if (!sideToExit) {
             // Only verify via API if enough time has passed

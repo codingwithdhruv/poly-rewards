@@ -153,11 +153,15 @@ export const REWARDS_CONFIG = {
         },
         TRADE_VELOCITY_WINDOW_MS: 30000, // 30s rolling window
         MIN_TRADE_RATE_EPSILON: 0.1, // Fallback for zero-trade markets (very safe)
-        DISTANCES: {
-            AGGRESSIVE: 0.005, // 0.5¢
-            MODERATE: 0.010,   // 1.0¢
-            DEFENSIVE: 0.015   // 1.5¢
+        // Phase 20: Spread-Relative Distance (replaced fixed DISTANCES)
+        SPREAD_MULTIPLIERS: {
+            AGGRESSIVE: 1.0,   // Match current spread
+            MODERATE: 1.5,     // 1.5x current spread
+            DEFENSIVE: 2.0     // 2x current spread
         },
+        // Safety bounds for spread-relative distances
+        MIN_DISTANCE_CENTS: 0.002,  // Absolute floor (0.2¢ or ~2 ticks)
+        MAX_DISTANCE_CENTS: 0.015,  // Absolute ceiling (1.5¢)
         HYSTERESIS_CYCLES: 2,   // Cycles to sustain before changing
         REPLENISH_THRESHOLD_USDC_PER_SEC: 1000 // Phase 18: $1000/sec inflow overrides thin depth
     }
