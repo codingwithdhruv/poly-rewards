@@ -145,7 +145,14 @@ export const REWARDS_CONFIG = {
     LIQUIDITY_PRESSURE: {
         ENABLE_DYNAMIC_DISTANCING: true,
         DEPTH_CHECK_INTERVAL_MS: 5000,
-        MIN_DEPTH_USDC: 1000, // Minimum cumulative size to consider "thick"
+        // Phase 19: Time-to-Consume Model (replaced MIN_DEPTH_USDC)
+        TTC_SAFETY_HORIZONS: {
+            AGGRESSIVE: 60,   // 60 seconds @ 0.5¢
+            MODERATE: 120,    // 120 seconds @ 1.0¢
+            DEFENSIVE: 240    // 240 seconds @ 1.5¢
+        },
+        TRADE_VELOCITY_WINDOW_MS: 30000, // 30s rolling window
+        MIN_TRADE_RATE_EPSILON: 0.1, // Fallback for zero-trade markets (very safe)
         DISTANCES: {
             AGGRESSIVE: 0.005, // 0.5¢
             MODERATE: 0.010,   // 1.0¢

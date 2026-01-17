@@ -70,9 +70,15 @@ interface MarketState {
         yesLastDepthTs?: number;
         noLastDepth1?: number;
         noLastDepthTs?: number;
-    };
+    }
     // Phase 16: Midpoint Tolerance
     lastQuotedMid?: number;
+    // Phase 19: Trade Velocity Tracking (TTC Model)
+    tradeVelocity?: {
+        recentTrades: Array<{ timestamp: number; value: number }>;
+        usdcPerSecond: number;
+        lastUpdate: number;
+    };
 }
 
 
@@ -1269,9 +1275,37 @@ export class RewardsStrategy implements Strategy {
             const LP_CONFIG = REWARDS_CONFIG.LIQUIDITY_PRESSURE;
 
             if (LP_CONFIG.ENABLE_DYNAMIC_DISTANCING) {
-                const MIN_DEPTH = LP_CONFIG.MIN_DEPTH_USDC;
+                // Phase 19: Calculate Trade Velocity (USDC/sec)
+                // Initialize trade velocity tracking if missing
+                if (!state.tradeVelocity) {
+                    state.tradeVelocity = {
+                        recentTrades: [],
+                        usdcPerSecond: LP_CONFIG.MIN_TRADE_RATE_EPSILON || 0.1,
+                        lastUpdate: Date.now()
+                    };
+                }
 
-                // Helper for Hysteresis Logic
+                // Update trade velocity from recent public trades
+                // Note: Public trades would be tracked via WebSocket in production
+                // For now, use a conservative fallback
+                const now = Date.now();
+                const windowMs = LP_CONFIG.TRADE_VELOCITY_WINDOW_MS || 30000;
+
+                // Filter trades within window
+                state.tradeVelocity.recentTrades = state.tradeVelocity.recentTrades.filter(
+                    t => now - t.timestamp < windowMs
+                );
+
+                // Calculate USDC/sec
+                const totalValue = state.tradeVelocity.recentTrades.reduce((sum, t) => sum + t.value, 0);
+                const tradeRateUSDC = totalValue > 0
+                    ? totalValue / (windowMs / 1000)
+                    : (LP_CONFIG.MIN_TRADE_RATE_EPSILON || 0.1); // Fallback for zero trades (very safe)
+
+                state.tradeVelocity.usdcPerSecond = tradeRateUSDC;
+                state.tradeVelocity.lastUpdate = now;
+
+                // Helper for Hysteresis Logic with TTC Model
                 const updatePressureState = (
                     currentDepth: DepthBands,
                     currentDist: number,
@@ -1297,20 +1331,28 @@ export class RewardsStrategy implements Strategy {
                         }
                     }
 
-                    // Check Aggressive Layer (0.5c)
-                    if (currentDepth.layer1 < MIN_DEPTH) {
-                        // Too thin? Usually retreat.
-                        // BUT: If replenishing fast, stay aggressive/moderate
-                        if (isReplenishingFast) {
-                            targetDist = LP_CONFIG.DISTANCES.MODERATE; // Compromise: Moderate instead of Defensive
-                        } else {
-                            // Check Moderate (1.0c)
-                            if (currentDepth.layer2 < MIN_DEPTH) {
-                                targetDist = LP_CONFIG.DISTANCES.DEFENSIVE;
-                            } else {
-                                targetDist = LP_CONFIG.DISTANCES.MODERATE;
-                            }
-                        }
+                    // Phase 19: Time-to-Consume (TTC) Model
+                    // Calculate TTC for each depth band
+                    const TTC_0_5c = currentDepth.layer1 / tradeRateUSDC;
+                    const TTC_1_0c = currentDepth.layer2 / tradeRateUSDC;
+                    const TTC_1_5c = currentDepth.layer3 / tradeRateUSDC;
+
+                    // Apply refill rate to effective TTC (Phase 18 enhancement)
+                    let effectiveTTC_0_5c = TTC_0_5c;
+                    if (isReplenishingFast && lastDepth1 !== undefined && lastDepthTs !== undefined) {
+                        const refillRate = (currentDepth.layer1 - lastDepth1) / ((now - lastDepthTs) / 1000);
+                        const horizon = LP_CONFIG.TTC_SAFETY_HORIZONS.AGGRESSIVE;
+                        const effectiveDepth = currentDepth.layer1 + refillRate * horizon;
+                        effectiveTTC_0_5c = effectiveDepth / tradeRateUSDC;
+                    }
+
+                    // Select distance based on TTC safety horizons
+                    if (effectiveTTC_0_5c >= LP_CONFIG.TTC_SAFETY_HORIZONS.AGGRESSIVE) {
+                        targetDist = LP_CONFIG.DISTANCES.AGGRESSIVE; // 0.5¢
+                    } else if (TTC_1_0c >= LP_CONFIG.TTC_SAFETY_HORIZONS.MODERATE) {
+                        targetDist = LP_CONFIG.DISTANCES.MODERATE; // 1.0¢
+                    } else {
+                        targetDist = LP_CONFIG.DISTANCES.DEFENSIVE; // 1.5¢
                     }
 
                     // Apply Hysteresis: Only change if condition persists
@@ -1344,9 +1386,11 @@ export class RewardsStrategy implements Strategy {
                 state.pressureState.noLastDepth1 = noUpdate.lastDepth1;
                 state.pressureState.noLastDepthTs = noUpdate.lastDepthTs;
 
-                // Log Significant Moves (Retreats)
+                // Log Significant Moves (Retreats) with TTC info
                 if (yesUpdate.cycles === 0 && yesUpdate.dist > 0.005 && yesUpdate.dist > state.pressureState.yesDistance) {
-                    this.logAction(state.gammaMarket.question, "PRESSURE", -1, -1, yesUpdate.dist, `YES Depth Thin ($${yesDepth.layer1.toFixed(0)} < $${MIN_DEPTH}). Retreating to ${yesUpdate.dist * 100}¢`);
+                    const yesTTC = yesDepth.layer1 / tradeRateUSDC;
+                    this.logAction(state.gammaMarket.question, "PRESSURE", -1, -1, yesUpdate.dist,
+                        `YES TTC ${yesTTC.toFixed(0)}s (Depth $${yesDepth.layer1.toFixed(0)} / Rate $${tradeRateUSDC.toFixed(1)}/s). Retreating to ${yesUpdate.dist * 100}¢`);
                 }
             }
 
