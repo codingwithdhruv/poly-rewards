@@ -1,7 +1,7 @@
 import { ethers } from "ethers";
 import { CONFIG } from "../clients/config.js";
 import { RelayClient } from "@polymarket/builder-relayer-client";
-import { createWalletClient, http, Hex, encodeFunctionData, parseUnits, getAddress, createPublicClient } from "viem";
+import { createWalletClient, http, Hex, encodeFunctionData, parseUnits, getAddress, createPublicClient, parseAbi } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { polygon } from "viem/chains";
 
@@ -100,21 +100,11 @@ export async function ensureCTFApprovals(relayer?: RelayClient) {
 
     const owner = CONFIG.POLY_PROXY_ADDRESS || privateKeyToAccount(CONFIG.PRIVATE_KEY as Hex).address;
 
-    const checkApproval = async (operator: string) => {
+    const checkApproval = async (operator: string): Promise<boolean> => {
         try {
-            const isApproved = await publicClient.readContract({
-                address: CTF_ADDRESS as Hex,
-                abi: [{
-                    name: "isApprovedForAll",
-                    type: "function",
-                    inputs: [{ name: "owner", type: "address" }, { name: "operator", type: "address" }],
-                    outputs: [{ name: "", type: "bool" }],
-                    stateMutability: "view"
-                }],
-                functionName: "isApprovedForAll",
-                args: [owner as Hex, operator as Hex]
-            });
-            return isApproved;
+            const provider = new ethers.providers.JsonRpcProvider(CONFIG.RPC_URL);
+            const contract = new ethers.Contract(CTF_ADDRESS, CTF_ABI, provider);
+            return await contract.isApprovedForAll(owner, operator);
         } catch (e) {
             console.warn(`[CTF] Failed to check approval for ${operator}:`, e);
             return false;
