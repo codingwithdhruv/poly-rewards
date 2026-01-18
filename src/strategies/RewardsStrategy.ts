@@ -10,7 +10,7 @@ import WebSocket from "ws";
 import * as ScoringCalc from "../lib/scoringCalculator.js";
 import { analyzeLiquidity, calculateAsymmetricDistances, analyzeDepthBands, DepthBands } from "../lib/orderbookAnalyzer.js";
 import * as OrderbookAnalyzer from "../lib/orderbookAnalyzer.js"; // Helper to get types if needed
-import { mergePositions } from "../lib/ctfHelper.js";
+import { mergePositions, ensureCTFApprovals } from "../lib/ctfHelper.js";
 
 interface TrackedOrder {
     orderId: string;
@@ -171,6 +171,9 @@ export class RewardsStrategy implements Strategy {
         this.relayClient = relayClient;
         this.gammaClient = new GammaClient();
         console.log("Rewards Strategy Initialized"); // v2.0 Production
+
+        // Critical Fix: Ensure CTF Exchange is approved
+        await ensureCTFApprovals(this.relayClient);
 
         if (this.creds) {
             this.initUserStream();
